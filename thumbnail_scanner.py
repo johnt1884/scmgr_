@@ -6,6 +6,7 @@ import concurrent.futures
 import shutil
 import re
 import hashlib
+import tempfile
 from datetime import datetime, timezone
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm')
@@ -16,7 +17,7 @@ def get_projects(base_path):
 
 def find_videos(project_path):
     videos = []
-    skip_dirs = {'thumbnails', 'edit thumbnails'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails'}
     for root, dirs, files in os.walk(project_path):
         dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
         for file in files:
@@ -223,15 +224,49 @@ def get_shortcut_target(path):
     if os.path.islink(path):
         return os.readlink(path)
     if path.lower().endswith('.lnk'):
-        # On Windows, use PowerShell to get target. In this environment, it's limited.
-        # But we'll implement it for the user's environment.
         if os.name == 'nt':
-            cmd = ['powershell', '-Command', f"(New-Object -ComObject WScript.Shell).CreateShortcut('{path}').TargetPath"]
+            escaped_path = path.replace("'", "''")
+            cmd = ['powershell', '-Command', f"(New-Object -ComObject WScript.Shell).CreateShortcut('{escaped_path}').TargetPath"]
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, check=True)
                 return result.stdout.strip()
             except Exception: return None
     return None
+
+def get_shortcut_targets_bulk(paths):
+    if not paths: return {}
+    results = {}
+    if os.name == 'nt':
+        # Use a temporary file to pass paths to PowerShell to avoid command line length limits
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as tmp:
+            for p in paths:
+                tmp.write(p + '\n')
+            tmp_path = tmp.name
+
+        try:
+            escaped_tmp_path = tmp_path.replace("'", "''")
+            ps_script = f"$s=New-Object -ComObject WScript.Shell; Get-Content '{escaped_tmp_path}' | ForEach-Object {{ try {{ $s.CreateShortcut($_).TargetPath }} catch {{ '' }} }}"
+            cmd = ['powershell', '-Command', ps_script]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            targets = result.stdout.splitlines()
+            for p, t in zip(paths, targets):
+                if t and t.strip():
+                    results[p] = t.strip()
+        except Exception as e:
+            print(f"Error in bulk shortcut resolution: {e}")
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    else:
+        for p in paths:
+            if os.path.islink(p):
+                try:
+                    results[p] = os.readlink(p)
+                except Exception:
+                    pass
+    return results
 
 def update_shortcut(path, new_target):
     try:
@@ -240,7 +275,9 @@ def update_shortcut(path, new_target):
             os.symlink(new_target, path)
             return True
         if path.lower().endswith('.lnk') and os.name == 'nt':
-            cmd = ['powershell', '-Command', f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{path}');$s.TargetPath='{new_target}';$s.Save()"]
+            escaped_path = path.replace("'", "''")
+            escaped_target = new_target.replace("'", "''")
+            cmd = ['powershell', '-Command', f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{escaped_path}');$s.TargetPath='{escaped_target}';$s.Save()"]
             subprocess.run(cmd, check=True)
             return True
     except Exception as e:
@@ -252,17 +289,19 @@ def update_sc_date():
     base_path = os.getcwd()
     root_sc = os.path.join(base_path, 'sc')
     cached = []
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails'}
+
     if os.path.exists(root_sc):
-        for f in os.listdir(root_sc):
-            if f.lower().endswith('.lnk'):
-                p = os.path.join(root_sc, f)
-                target = get_shortcut_target(p)
-                if target:
-                    mtime = os.path.getmtime(p)
-                    cached.append({'target': target, 'date': datetime.fromtimestamp(mtime, timezone.utc).replace(tzinfo=None)})
+        lnk_paths = [os.path.join(root_sc, f) for f in os.listdir(root_sc) if f.lower().endswith('.lnk')]
+        if lnk_paths:
+            targets_map = get_shortcut_targets_bulk(lnk_paths)
+            for p, target in targets_map.items():
+                mtime = os.path.getmtime(p)
+                cached.append({'target': target, 'date': datetime.fromtimestamp(mtime, timezone.utc).replace(tzinfo=None)})
 
     target_dirs = {base_path}
     for root, dirs, files in os.walk(base_path):
+        dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
         if 'sc' in dirs:
             target_dirs.add(root)
 
@@ -270,6 +309,21 @@ def update_sc_date():
         dp = os.path.join(base_path, d)
         if os.path.isdir(dp) and d.lower() not in ('sc', 'landscape', 'landscape rotate', 'edit', 'thumbnails', 'edit thumbnails'):
             target_dirs.add(dp)
+
+    # Build a map of directory -> newest cached date to avoid O(N*M) nested loop
+    cached_map = {}
+    for c in cached:
+        try:
+            # We want to find which of our target_dirs this cached shortcut target belongs to.
+            # Most likely it's a direct project folder or the base_path itself.
+            target = c['target']
+            for d in target_dirs:
+                if d == base_path: continue
+                if target.startswith(d + os.sep) or target == d:
+                    if d not in cached_map or c['date'] > cached_map[d]:
+                        cached_map[d] = c['date']
+        except Exception:
+            pass
 
     for directory in target_dirs:
         out_file = os.path.join(directory, 'scdate.txt')
@@ -281,11 +335,9 @@ def update_sc_date():
                 latest_lnk = max(lnks, key=os.path.getmtime)
                 newest = datetime.fromtimestamp(os.path.getmtime(latest_lnk), timezone.utc).replace(tzinfo=None)
 
-        if directory != base_path:
-            for c in cached:
-                if c['target'].startswith(directory + os.sep) or c['target'] == directory:
-                    if c['date'] > newest:
-                        newest = c['date']
+        if directory in cached_map:
+            if cached_map[directory] > newest:
+                newest = cached_map[directory]
 
         if newest > datetime.min:
             write = True
@@ -314,8 +366,10 @@ def update_sc_date():
 def update_sc_data():
     print("\nUpdating scdata.txt files...")
     base_path = os.getcwd()
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails'}
     # Recursive sc folders
     for root, dirs, files in os.walk(base_path):
+        dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
         if 'sc' in dirs:
             sc_path = os.path.join(root, 'sc')
             links = [f for f in os.listdir(sc_path) if f.lower().endswith('.lnk')]
@@ -330,20 +384,22 @@ def update_sc_data():
     out = os.path.join(base_path, 'rootdata.txt')
     if os.path.exists(root_sc):
         groups = {}
-        for f in os.listdir(root_sc):
-            if f.lower().endswith('.lnk'):
-                p = os.path.join(root_sc, f)
-                t = get_shortcut_target(p)
+        lnk_paths = [os.path.join(root_sc, f) for f in os.listdir(root_sc) if f.lower().endswith('.lnk')]
+        if lnk_paths:
+            targets_map = get_shortcut_targets_bulk(lnk_paths)
+            for f_name in sorted(os.listdir(root_sc)):
+                p = os.path.join(root_sc, f_name)
+                t = targets_map.get(p)
                 if t:
                     folder_path = os.path.dirname(t)
                     folder = os.path.basename(folder_path)
                     tag = '[ROOT]'
                     sub_sc = os.path.join(folder_path, 'sc')
-                    if os.path.exists(os.path.join(sub_sc, f)):
+                    if os.path.exists(os.path.join(sub_sc, f_name)):
                         tag = '[BOTH]'
                     if folder not in groups:
                         groups[folder] = []
-                    groups[folder].append(f"{f} {tag}")
+                    groups[folder].append(f"{f_name} {tag}")
 
         if groups:
             with open(out, 'w', encoding='utf-8') as f:
@@ -363,12 +419,11 @@ def generate_sc_new():
     root_sc = os.path.join(base_path, 'sc')
     root_links_data = []
     if os.path.exists(root_sc):
-        for f in os.listdir(root_sc):
-            if f.lower().endswith('.lnk'):
-                p = os.path.join(root_sc, f)
-                t = get_shortcut_target(p)
-                if t:
-                    root_links_data.append({'path': p, 'target': t, 'mtime': os.path.getmtime(p)})
+        lnk_paths = [os.path.join(root_sc, f) for f in os.listdir(root_sc) if f.lower().endswith('.lnk')]
+        if lnk_paths:
+            targets_map = get_shortcut_targets_bulk(lnk_paths)
+            for p, t in targets_map.items():
+                root_links_data.append({'path': p, 'target': t, 'mtime': os.path.getmtime(p)})
 
     for d in os.listdir(base_path):
         dp = os.path.join(base_path, d)
@@ -428,6 +483,7 @@ def update_shortcut_database():
     base_path = os.getcwd()
     db_file = "shortcut_db.txt"
     database = []
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails'}
     if os.path.exists(db_file):
         with open(db_file, 'r') as f:
             current_entry = {}
@@ -442,31 +498,41 @@ def update_shortcut_database():
                     current_entry = {}
 
     new_database = []
+    # Collect all shortcuts first
+    all_lnk_paths = []
     for root, dirs, files in os.walk(base_path):
+        dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
         for file in files:
             if file.lower().endswith('.lnk'):
-                lnk_path = os.path.join(root, file)
-                target = get_shortcut_target(lnk_path)
-                if not target: continue
+                all_lnk_paths.append(os.path.join(root, file))
 
-                if not target.lower().endswith(VIDEO_EXTENSIONS): continue
+    # Bulk resolve
+    targets_map = get_shortcut_targets_bulk(all_lnk_paths)
 
-                existing = next((e for e in database if e['FolderPath'] == root and e['ShortcutName'] == file), None)
-                if existing:
-                    if os.path.exists(target):
-                        existing['VideoPath'] = target
-                        existing['MD5'] = get_md5(target)
-                    new_database.append(existing)
-                else:
-                    if os.path.exists(target):
-                        md5 = get_md5(target)
-                        new_database.append({
-                            'FolderPath': root,
-                            'ShortcutName': file,
-                            'VideoPath': target,
-                            'MD5': md5
-                        })
-                        print(f"Added: {file}")
+    for lnk_path in all_lnk_paths:
+        file = os.path.basename(lnk_path)
+        root = os.path.dirname(lnk_path)
+        target = targets_map.get(lnk_path)
+        if not target: continue
+
+        if not target.lower().endswith(VIDEO_EXTENSIONS): continue
+
+        existing = next((e for e in database if e['FolderPath'] == root and e['ShortcutName'] == file), None)
+        if existing:
+            if os.path.exists(target):
+                existing['VideoPath'] = target
+                existing['MD5'] = get_md5(target)
+            new_database.append(existing)
+        else:
+            if os.path.exists(target):
+                md5 = get_md5(target)
+                new_database.append({
+                    'FolderPath': root,
+                    'ShortcutName': file,
+                    'VideoPath': target,
+                    'MD5': md5
+                })
+                print(f"Added: {file}")
 
     with open(db_file, 'w', encoding='utf-8') as f:
         for entry in new_database:
@@ -544,22 +610,29 @@ def run_broken_shortcuts_scan(generate_report=False):
     base_path = os.getcwd()
     projects = get_projects(base_path)
     broken_shortcuts = [] # list of (shortcut_path, current_target)
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails'}
 
-    def scan_dir_for_shortcuts(directory):
+    def scan_dir_for_shortcuts(directory, shortcuts_to_check):
         if not os.path.isdir(directory): return
         for f in os.listdir(directory):
             p = os.path.join(directory, f)
             if is_shortcut(p):
-                target = get_shortcut_target(p)
-                if not target or not os.path.exists(target):
-                    broken_shortcuts.append((p, target))
+                shortcuts_to_check.append(p)
 
     print("\nScanning for broken shortcuts...")
+    all_lnk_to_check = []
     # Scan root
-    scan_dir_for_shortcuts(base_path)
+    scan_dir_for_shortcuts(base_path, all_lnk_to_check)
     # Scan each project's 'sc' folder
     for project in projects:
-        scan_dir_for_shortcuts(os.path.join(base_path, project, 'sc'))
+        scan_dir_for_shortcuts(os.path.join(base_path, project, 'sc'), all_lnk_to_check)
+
+    if all_lnk_to_check:
+        targets_map = get_shortcut_targets_bulk(all_lnk_to_check)
+        for p in all_lnk_to_check:
+            target = targets_map.get(p)
+            if not target or not os.path.exists(target):
+                broken_shortcuts.append((p, target))
 
     if not broken_shortcuts:
         print("No broken shortcuts found.")
