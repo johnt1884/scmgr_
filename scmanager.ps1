@@ -563,7 +563,7 @@ function Check-Thumbnails {
                     } catch {}
                 }
             }
-            $fixScriptContent = "@echo off`r`necho Starting thumbnail fix process...`r`n" + ($fixCommands | Select-Object -Unique -join "`r`n") + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
+            $fixScriptContent = "@echo off`r`necho Starting thumbnail fix process...`r`n" + (($fixCommands | Select-Object -Unique) -join "`r`n") + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
             [System.IO.File]::WriteAllText((Join-Path (Get-Location) "fix_thumbnails.bat"), $fixScriptContent, [System.Text.Encoding]::UTF8)
             Write-Host "`nfix_thumbnails.bat has been generated." -ForegroundColor Green
         }
@@ -664,7 +664,7 @@ function Update-New-Thumbnails {
                     } catch {}
                 }
             }
-            $fixScriptContent = "@echo off`r`necho Starting fast thumbnail fix process...`r`n" + ($fixCommands | Select-Object -Unique -join "`r`n") + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
+            $fixScriptContent = "@echo off`r`necho Starting fast thumbnail fix process...`r`n" + (($fixCommands | Select-Object -Unique) -join "`r`n") + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
             [System.IO.File]::WriteAllText((Join-Path (Get-Location) "fix_thumbnails.bat"), $fixScriptContent, [System.Text.Encoding]::UTF8)
             Write-Host "`nfix_thumbnails.bat has been generated." -ForegroundColor Green
         }
