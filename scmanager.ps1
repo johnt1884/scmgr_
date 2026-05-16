@@ -93,11 +93,14 @@ function Show-Menu {
     Write-Host ""
     Write-Host "   TOOLS"
     Write-Host "   ------------------"
-    Write-Host "   6. Check Thumbnails (All)"
-    Write-Host "   7. Update New Thumbnails (Fast)"
-    Write-Host "   8. Shortcut Manager"
+    Write-Host "   6. Check Thumbnails (All, Fast)"
+    Write-Host "   7. Check Thumbnails (All, Dimension Check)"
+    Write-Host "   8. Update New Thumbnails"
+    Write-Host "   9. Shortcut Manager"
+    Write-Host "   10. Check for empty videos"
+    Write-Host "   11. Check for broken shortcuts"
     Write-Host ""
-    Write-Host "   9. Exit"
+    Write-Host "   12. Exit"
     Write-Host ""
 }
 
@@ -161,6 +164,94 @@ function Update-ScDate {
                 $isoDate = $newest.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
                 Set-Content -Path $out -Value $isoDate -Encoding ASCII
             }
+        }
+    }
+}
+
+function Check-EmptyVideos {
+    Write-Host "`nScanning for empty videos (<2KB)..." -ForegroundColor Cyan
+    $allProjectFolders = Get-ProjectFolders
+    $emptyVideos = New-Object System.Collections.Generic.List[string]
+
+    foreach ($folder in $allProjectFolders) {
+        $videos = Get-VideoFiles -projectFolder $folder
+        foreach ($v in $videos) {
+            if ($v.Length -lt 2KB) {
+                $emptyVideos.Add($v.FullName)
+            }
+        }
+    }
+
+    if ($emptyVideos.Count -gt 0) {
+        Write-Host "`nEmpty videos found:" -ForegroundColor Red
+        foreach ($v in $emptyVideos) {
+            Write-Host " - $v ($($v.Length) bytes)"
+        }
+    } else {
+        Write-Host "`nNo empty videos found." -ForegroundColor Green
+    }
+}
+
+function Check-BrokenShortcutsLive {
+    Write-Host "`nScanning for broken shortcuts..." -ForegroundColor Cyan
+    $allLinks = Get-ChildItem -Path . -Filter *.lnk -Recurse
+    $brokenLinks = @()
+
+    foreach ($lnk in $allLinks) {
+        $target = $ws.CreateShortcut($lnk.FullName).TargetPath
+        if ($target -and -not (Test-Path -LiteralPath $target)) {
+            $brokenLinks += $lnk
+        }
+    }
+
+    if ($brokenLinks.Count -eq 0) {
+        Write-Host "No broken shortcuts found." -ForegroundColor Green
+        return
+    }
+
+    Write-Host "Found $($brokenLinks.Count) broken shortcuts:" -ForegroundColor Red
+    foreach ($lnk in $brokenLinks) {
+        Write-Host " - $($lnk.FullName)"
+    }
+
+    $fixChoice = Read-Host "`nWould you like to search for the missing files within subfolders and offer to fix? (y/n)"
+    if ($fixChoice -ne 'y') { return }
+
+    $allProjectFolders = Get-ProjectFolders
+    Write-Host "Scanning all project folders for videos (caching)..." -ForegroundColor Gray
+    $allVideosCache = @()
+    foreach ($folder in $allProjectFolders) {
+        $allVideosCache += Get-VideoFiles -projectFolder $folder
+    }
+
+    foreach ($lnk in $brokenLinks) {
+        $fileName = [System.IO.Path]::GetFileName($ws.CreateShortcut($lnk.FullName).TargetPath)
+        Write-Host "`nSearching for: $fileName" -ForegroundColor Yellow
+
+        $foundFiles = $allVideosCache | Where-Object { $_.Name -eq $fileName }
+
+        $foundCount = 0
+        if ($foundFiles) { $foundCount = @($foundFiles).Count }
+
+        if ($foundCount -gt 0) {
+            Write-Host "Found match(es):" -ForegroundColor Green
+            $foundFilesArray = @($foundFiles)
+            for ($i = 0; $i -lt $foundFilesArray.Count; $i++) {
+                Write-Host "  $($i + 1). $($foundFilesArray[$i].FullName)"
+            }
+            $selection = Read-Host "Select a file to repair the shortcut (1-$($foundFilesArray.Count)) or press Enter to skip"
+            if ($selection -match '^\d+$') {
+                $index = [int]$selection - 1
+                if ($index -ge 0 -and $index -lt $foundFilesArray.Count) {
+                    $newTarget = $foundFilesArray[$index].FullName
+                    $s = $ws.CreateShortcut($lnk.FullName)
+                    $s.TargetPath = $newTarget
+                    $s.Save()
+                    Write-Host "Shortcut repaired: $($lnk.Name) -> $newTarget" -ForegroundColor Green
+                }
+            }
+        } else {
+            Write-Host "No matching file found for $fileName" -ForegroundColor Gray
         }
     }
 }
@@ -274,17 +365,28 @@ function Update-Selections {
 }
 
 function Check-Thumbnails {
+    param($Fast = $false)
     # Ported from check_thumbnails.ps1
 
     $allProjectFolders = Get-ProjectFolders
     $overallIssues = @{ MissingRegular = 0; MissingEdit = 0; WrongDimensions = 0; Obsolete = 0 }
     $fixCommands = @()
+    $obsoleteFiles = New-Object System.Collections.Generic.List[string]
 
     Write-Host "`nStarting thumbnail check for all project folders..." -ForegroundColor Yellow
 
+    $totalFolders = $allProjectFolders.Count
+    if ($totalFolders -eq 0) {
+        Write-Host "`nNo project folders found." -ForegroundColor Yellow
+        return
+    }
+    $currentFolderIndex = 0
+
     foreach ($folder in $allProjectFolders) {
+        $currentFolderIndex++
+        $percent = [math]::Floor(($currentFolderIndex / $totalFolders) * 100)
         Write-Host "`n--------------------------------------------------"
-        Write-Host "Checking Project: $($folder.Name)" -ForegroundColor Cyan
+        Write-Host "[$percent%] Checking Project: $($folder.Name)" -ForegroundColor Cyan
         Write-Host "--------------------------------------------------"
 
         $videos = Get-VideoFiles -projectFolder $folder
@@ -325,11 +427,13 @@ function Check-Thumbnails {
             Get-ChildItem -LiteralPath $regularThumbsDir -Filter *.jpg -File | ForEach-Object {
                 $thumbBasename = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
                 if ($thumbBasename -in $videoBasenames) {
-                    try {
-                        $img = [System.Drawing.Image]::FromFile($_.FullName)
-                        $correctedDims = Get-CorrectedImageDimensions -image $img
-                        if ($correctedDims.Width -gt $thumbWidth -or $correctedDims.Height -gt $thumbHeight) { $projectIssues.WrongDimensions.Add($_.FullName) }
-                    } finally { if ($img) { $img.Dispose() } }
+                    if (-not $Fast) {
+                        try {
+                            $img = [System.Drawing.Image]::FromFile($_.FullName)
+                            $correctedDims = Get-CorrectedImageDimensions -image $img
+                            if ($correctedDims.Width -gt $thumbWidth -or $correctedDims.Height -gt $thumbHeight) { $projectIssues.WrongDimensions.Add($_.FullName) }
+                        } finally { if ($img) { $img.Dispose() } }
+                    }
                 } else { $projectIssues.ObsoleteRegular.Add($_.FullName) }
             }
         }
@@ -337,11 +441,13 @@ function Check-Thumbnails {
             Get-ChildItem -LiteralPath $editThumbsDir -Filter *.jpg -File | ForEach-Object {
                 $videoBasename = Find-VideoBasenameForEditThumbnail -thumbName $_.Name -videoBasenames $videoBasenames
                 if ($videoBasename -ne $null) {
-                    try {
-                        $img = [System.Drawing.Image]::FromFile($_.FullName)
-                        $correctedDims = Get-CorrectedImageDimensions -image $img
-                        if ($correctedDims.Width -gt $thumbWidth -or $correctedDims.Height -gt $thumbHeight) { $projectIssues.WrongDimensions.Add($_.FullName) }
-                    } finally { if ($img) { $img.Dispose() } }
+                    if (-not $Fast) {
+                        try {
+                            $img = [System.Drawing.Image]::FromFile($_.FullName)
+                            $correctedDims = Get-CorrectedImageDimensions -image $img
+                            if ($correctedDims.Width -gt $thumbWidth -or $correctedDims.Height -gt $thumbHeight) { $projectIssues.WrongDimensions.Add($_.FullName) }
+                        } finally { if ($img) { $img.Dispose() } }
+                    }
                 } else { $projectIssues.ObsoleteEdit.Add($_.FullName) }
             }
         }
@@ -413,12 +519,20 @@ function Check-Thumbnails {
                 }
             }
             if ($projectIssues.ObsoleteRegular.Count -gt 0) {
-                Write-Host " - Obsolete Regular Thumbnails: $($projectIssues.ObsoleteRegular.Count)" -ForegroundColor Red
-                $projectIssues.ObsoleteRegular | ForEach-Object { $overallIssues.Obsolete++; $fixCommands += 'if exist "' + $_ + '" del "' + $_ + '"' }
+                Write-Host " - Obsolete Regular Thumbnails (No corresponding video): $($projectIssues.ObsoleteRegular.Count)" -ForegroundColor Red
+                $projectIssues.ObsoleteRegular | ForEach-Object {
+                    $overallIssues.Obsolete++
+                    $obsoleteFiles.Add($_)
+                    $fixCommands += 'if exist "' + $_ + '" del "' + $_ + '"'
+                }
             }
             if ($projectIssues.ObsoleteEdit.Count -gt 0) {
-                Write-Host " - Obsolete Edit Thumbnails: $($projectIssues.ObsoleteEdit.Count)" -ForegroundColor Red
-                $projectIssues.ObsoleteEdit | ForEach-Object { $overallIssues.Obsolete++; $fixCommands += 'if exist "' + $_ + '" del "' + $_ + '"' }
+                Write-Host " - Obsolete Edit Thumbnails (No corresponding video): $($projectIssues.ObsoleteEdit.Count)" -ForegroundColor Red
+                $projectIssues.ObsoleteEdit | ForEach-Object {
+                    $overallIssues.Obsolete++
+                    $obsoleteFiles.Add($_)
+                    $fixCommands += 'if exist "' + $_ + '" del "' + $_ + '"'
+                }
             }
         }
     }
@@ -432,6 +546,22 @@ function Check-Thumbnails {
         Write-Host "Missing Edit Sets:          $($overallIssues.MissingEdit)"
         Write-Host "Wrong Dimensions:           $($overallIssues.WrongDimensions)"
         Write-Host "Obsolete Thumbnails:        $($overallIssues.Obsolete)"
+
+        if ($obsoleteFiles.Count -gt 0) {
+            $delChoice = Read-Host "`n$($obsoleteFiles.Count) obsolete thumbnails (no corresponding video) found. Delete them now? (y/n)"
+            if ($delChoice -eq 'y') {
+                foreach ($file in $obsoleteFiles) {
+                    if (Test-Path -LiteralPath $file) {
+                        Remove-Item -LiteralPath $file -Force
+                        Write-Host "Deleted: $file" -ForegroundColor Gray
+                    }
+                }
+                Write-Host "Obsolete thumbnails deleted." -ForegroundColor Green
+                # Clear obsolete from overall issues since they are gone
+                $overallIssues.Obsolete = 0
+            }
+        }
+
         $choice = Read-Host "`nIssues found. Would you like to generate a 'fix_thumbnails.bat' script to resolve them? (y/n)"
         if ($choice -eq 'y') {
             $fixScriptContent = "@echo off`r`nsetlocal enabledelayedexpansion`r`necho Starting thumbnail fix process...`r`n" + ($fixCommands -join "`r`n") + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
@@ -446,8 +576,14 @@ function Update-New-Thumbnails {
     $allProjectFolders = Get-ProjectFolders
     $fixCommands = @()
     $newVideoCount = 0
+    $obsoleteFiles = New-Object System.Collections.Generic.List[string]
+
+    $totalFolders = $allProjectFolders.Count
+    $currentFolderIndex = 0
 
     foreach ($folder in $allProjectFolders) {
+        $currentFolderIndex++
+        $percent = [math]::Floor(($currentFolderIndex / $totalFolders) * 100)
         $scDatePath = Join-Path $folder.FullName "scdate.txt"
         $cutoff = [DateTime]::MinValue
         if (Test-Path $scDatePath) {
@@ -459,13 +595,31 @@ function Update-New-Thumbnails {
         }
 
         $videos = Get-VideoFiles -projectFolder $folder
+        $videoBasenames = $videos | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) }
         $newVideos = $videos | Where-Object { $_.LastWriteTime.ToUniversalTime() -gt $cutoff }
         
-        if ($newVideos) {
-            Write-Host "Checking Project: $($folder.Name) ($($newVideos.Count) new videos)" -ForegroundColor Cyan
-            $regularThumbsDir = Join-Path $folder.FullName "Thumbnails"
-            $editThumbsDir = Join-Path $folder.FullName "Edit Thumbnails"
+        $regularThumbsDir = Join-Path $folder.FullName "Thumbnails"
+        $editThumbsDir = Join-Path $folder.FullName "Edit Thumbnails"
 
+        # Check for obsolete thumbnails (all thumbnail scans should do this)
+        if (Test-Path -LiteralPath $regularThumbsDir) {
+            Get-ChildItem -LiteralPath $regularThumbsDir -Filter *.jpg -File | ForEach-Object {
+                if ([System.IO.Path]::GetFileNameWithoutExtension($_.Name) -notin $videoBasenames) {
+                    $obsoleteFiles.Add($_.FullName)
+                }
+            }
+        }
+        if (Test-Path -LiteralPath $editThumbsDir) {
+            Get-ChildItem -LiteralPath $editThumbsDir -Filter *.jpg -File | ForEach-Object {
+                if ((Find-VideoBasenameForEditThumbnail -thumbName $_.Name -videoBasenames $videoBasenames) -eq $null) {
+                    $obsoleteFiles.Add($_.FullName)
+                }
+            }
+        }
+
+        Write-Host "[$percent%] Checking Project: $($folder.Name)..." -ForegroundColor Cyan
+        if ($newVideos) {
+            Write-Host " -> Found $($newVideos.Count) new videos" -ForegroundColor Gray
             foreach ($video in $newVideos) {
                 $newVideoCount++
                 $baseName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
@@ -507,17 +661,34 @@ function Update-New-Thumbnails {
         }
     }
 
+    if ($obsoleteFiles.Count -gt 0) {
+        $delChoice = Read-Host "`n$($obsoleteFiles.Count) obsolete thumbnails (no corresponding video) found. Delete them now? (y/n)"
+        if ($delChoice -eq 'y') {
+            foreach ($file in $obsoleteFiles) {
+                if (Test-Path -LiteralPath $file) {
+                    Remove-Item -LiteralPath $file -Force
+                    Write-Host "Deleted: $file" -ForegroundColor Gray
+                }
+            }
+            Write-Host "Obsolete thumbnails deleted." -ForegroundColor Green
+        } else {
+            foreach ($file in $obsoleteFiles) {
+                $fixCommands += 'if exist "' + $file + '" del "' + $file + '"'
+            }
+        }
+    }
+
     if ($fixCommands.Count -gt 0) {
-        Write-Host "`nFound missing thumbnails for new videos." -ForegroundColor Red
+        Write-Host "`nFound missing or obsolete thumbnails." -ForegroundColor Red
         $choice = Read-Host "Would you like to generate a 'fix_thumbnails.bat' script to resolve them? (y/n)"
         if ($choice -eq 'y') {
-            $fixScriptContent = "@echo off`r`necho Starting fast thumbnail fix process...`r`n" + ($fixCommands | Select-Object -Unique | Out-String).Trim() + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
+            $fixScriptContent = "@echo off`r`necho Starting fast thumbnail fix process...`r`n" + ($fixCommands | Select-Object -Unique | ForEach-Object { $_ }) -join "`r`n" + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
             # Ensure we use \r\n and correct encoding
             [System.IO.File]::WriteAllText((Join-Path (Get-Location) "fix_thumbnails.bat"), $fixScriptContent, [System.Text.Encoding]::UTF8)
             Write-Host "`nfix_thumbnails.bat has been generated." -ForegroundColor Green
         }
     } else {
-        Write-Host "`nAll new videos ($newVideoCount) already have thumbnails." -ForegroundColor Green
+        Write-Host "`nAll new videos ($newVideoCount) already have thumbnails and no obsolete thumbnails found." -ForegroundColor Green
     }
 }
 
@@ -708,10 +879,13 @@ while ($true) {
             "3" { Generate-ScNew }
             "4" { Update-Selections }
             "5" { Update-ScDate; Update-ScData; Generate-ScNew; Update-Selections }
-            "6" { Check-Thumbnails }
-            "7" { Update-New-Thumbnails }
-            "8" { Shortcut-Manager-Menu }
-            "9" { exit }
+            "6" { Check-Thumbnails -Fast $true }
+            "7" { Check-Thumbnails -Fast $false }
+            "8" { Update-New-Thumbnails }
+            "9" { Shortcut-Manager-Menu }
+            "10" { Check-EmptyVideos }
+            "11" { Check-BrokenShortcutsLive }
+            "12" { exit }
             Default { Write-Host "Invalid option: $c" -ForegroundColor Red }
         }
     }
