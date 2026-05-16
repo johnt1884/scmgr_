@@ -10,9 +10,6 @@ from datetime import datetime, timezone
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.JPG', '.JPEG', '.PNG', '.WEBP')
-LANDSCAPE_TARGET_WIDTH = 342
-PORTRAIT_TARGET_WIDTH = 192
-TARGET_HEIGHT = 256
 
 def get_projects(base_path):
     return [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d)) and not d.startswith('.')]
@@ -165,84 +162,41 @@ def generate_video_thumbnails(task):
                         existing_images[i] = (edit_path, w, h)
                         break
 
-    # Determine landscape based on raw video dimensions
+    # Determine orientation based on raw video dimensions
     is_landscape = v_width >= v_height
 
-    # Determine target dimensions for each missing slot
-    target_dims = {} # slot_index -> (w, h)
-    
-    # Default targets if ALL images are missing
+    # Rule: Preserve aspect ratio. Landscape h=256, Portrait w=192.
     if is_landscape:
-        default_max_w, default_max_h = LANDSCAPE_TARGET_WIDTH, TARGET_HEIGHT
+        scale_str = "scale=-1:256"
     else:
-        default_max_w, default_max_h = PORTRAIT_TARGET_WIDTH, TARGET_HEIGHT
-
-    for slot in slots_to_generate:
-        # Deep Scan fallback: if we are fixing wrong dimensions, use the ideal target
-        if force_ideal:
-            if v_width > 0 and v_height > 0:
-                scale = min(default_max_w / v_width, default_max_h / v_height)
-                target_dims[slot] = (int(v_width * scale), int(v_height * scale))
-            else:
-                target_dims[slot] = (default_max_w, default_max_h)
-            continue
-
-        # Rule: Use dimensions of the preceding image present in the series
-        found_preceding = False
-        for prev_slot in range(slot - 1, -1, -1):
-            if prev_slot in existing_images:
-                target_dims[slot] = (existing_images[prev_slot][1], existing_images[prev_slot][2])
-                found_preceding = True
-                break
-        
-        if not found_preceding:
-            # Check if ANY image is present for this video to determine if "all are missing"
-            if not existing_images:
-                # ALL missing: use target dimensions whilst maintaining aspect ratio
-                if v_width > 0 and v_height > 0:
-                    scale = min(default_max_w / v_width, default_max_h / v_height)
-                    target_dims[slot] = (int(v_width * scale), int(v_height * scale))
-                else:
-                    target_dims[slot] = (default_max_w, default_max_h)
-            else:
-                # Some are present, but none preceding. 
-                first_available_slot = min(existing_images.keys())
-                target_dims[slot] = (existing_images[first_available_slot][1], existing_images[first_available_slot][2])
-
-    # Group by dimensions to minimize FFmpeg calls
-    groups = {} # (w, h) -> [slots]
-    for slot, dims in target_dims.items():
-        if dims not in groups: groups[dims] = []
-        groups[dims].append(slot)
+        scale_str = "scale=192:-1"
 
     success = True
     try:
-        for (tw, th), slots in groups.items():
-            unique_frames = sorted(list(set(all_target_frames[s] for s in slots)))
-            select_str = " + ".join([f"eq(n,{idx})" for idx in unique_frames])
-            # Use scale filter to match target dimensions
-            filter_parts = [f"select='{select_str}'"]
-            filter_parts.append(f"scale={tw}:{th}")
-            filter_parts.append("setpts=N/FRAME_RATE/TB")
-            
-            filter_graph = ",".join(filter_parts)
-            
-            temp_pattern = os.path.join(project_path, f"tmp_{video_name}_{tw}_{th}_%d.jpg")
-            cmd = [
-                'ffmpeg', '-y', '-threads', '1', '-i', video_path,
-                '-vf', filter_graph, '-vsync', 'vfr', '-q:v', '2',
-                temp_pattern
-            ]
-            
-            if subprocess.run(cmd, capture_output=True).returncode != 0:
-                success = False
-                continue
+        # We'll generate all requested slots in one pass with the same scaling
+        unique_frames = sorted(list(set(all_target_frames[s] for s in slots_to_generate)))
+        select_str = " + ".join([f"eq(n,{idx})" for idx in unique_frames])
 
+        filter_parts = [f"select='{select_str}'"]
+        filter_parts.append(scale_str)
+        filter_parts.append("setpts=N/FRAME_RATE/TB")
+        filter_graph = ",".join(filter_parts)
+            
+        temp_pattern = os.path.join(project_path, f"tmp_{video_name}_%d.jpg")
+        cmd = [
+            'ffmpeg', '-y', '-threads', '1', '-i', video_path,
+            '-vf', filter_graph, '-vsync', 'vfr', '-q:v', '2',
+            temp_pattern
+        ]
+
+        if subprocess.run(cmd, capture_output=True).returncode != 0:
+            success = False
+        else:
             # Move/Rename
             os.makedirs(thumb_dir, exist_ok=True)
             os.makedirs(edit_dir, exist_ok=True)
             
-            for slot in slots:
+            for slot in slots_to_generate:
                 frame_idx = all_target_frames[slot]
                 out_idx = unique_frames.index(frame_idx) + 1
                 src = temp_pattern % out_idx
@@ -250,7 +204,8 @@ def generate_video_thumbnails(task):
                     dst = os.path.join(thumb_dir, f"{video_name}.jpg")
                 else:
                     dst = os.path.join(edit_dir, f"{video_name}_{slot}.jpg")
-                shutil.copy2(src, dst)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
             
             # Cleanup
             for i in range(1, len(unique_frames) + 1):
@@ -265,17 +220,10 @@ def generate_video_thumbnails(task):
         if 10 in missing_edits:
             slot_10_path = os.path.join(edit_dir, f"{video_name}_10.jpg")
             if not os.path.exists(slot_10_path):
-                # Try to extract the very last possible frame
-                tw, th = target_dims[10]
-                
-                # Build fallback filter
-                fallback_filter = [f"scale={tw}:{th}"]
-                fallback_filter_str = ",".join(fallback_filter)
-
                 # Using -sseof -1 allows seeking to 1 second before end
                 cmd_fallback = [
                     'ffmpeg', '-y', '-sseof', '-1', '-i', video_path,
-                    '-vf', fallback_filter_str, '-update', '1', '-frames:v', '1', '-q:v', '2',
+                    '-vf', scale_str, '-update', '1', '-frames:v', '1', '-q:v', '2',
                     slot_10_path
                 ]
                 if subprocess.run(cmd_fallback, capture_output=True).returncode != 0:
@@ -814,25 +762,29 @@ def run_normal_scan(deep_scan=False, generate_report=False):
                 if v_width > 0 and v_height > 0:
                     is_landscape = v_width >= v_height
 
+                    # Rule: Preserve aspect ratio. Landscape h=256, Portrait w=192.
                     if is_landscape:
-                        default_max_w, default_max_h = LANDSCAPE_TARGET_WIDTH, TARGET_HEIGHT
+                        target_h = 256
+                        target_w = int(v_width * (256 / v_height))
                     else:
-                        default_max_w, default_max_h = PORTRAIT_TARGET_WIDTH, TARGET_HEIGHT
-
-                    scale = min(default_max_w / v_width, default_max_h / v_height)
-                    target_w, target_h = int(v_width * scale), int(v_height * scale)
+                        target_w = 192
+                        target_h = int(v_height * (192 / v_width))
                     
+                    # Tolerance for rounding: allow +/- 2 pixels
+                    def dims_match(w, h, tw, th):
+                        return abs(w - tw) <= 2 and abs(h - th) <= 2
+
                     if main_file:
                         main_path = os.path.join(thumb_dir, main_file)
                         w, h = get_image_dimensions(main_path)
-                        if w != target_w or h != target_h:
+                        if not dims_match(w, h, target_w, target_h):
                             needs_main_fix = True
                             results['total_wrong_dimensions'] += 1
 
                     for i, f in zip(edit_indices, edit_files_found):
                         edit_path = os.path.join(edit_dir, f)
                         w, h = get_image_dimensions(edit_path)
-                        if w != target_w or h != target_h:
+                        if not dims_match(w, h, target_w, target_h):
                             wrong_dim_edits.append(i)
                             results['total_wrong_dimensions'] += 1
 
