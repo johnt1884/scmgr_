@@ -389,10 +389,13 @@ function Check-Thumbnails {
         $thumbDir = Join-Path $folder.FullName "Thumbnails"
         $editDir = Join-Path $folder.FullName "Edit Thumbnails"
 
-        $thumbFiles = @(if (Test-Path $thumbDir) { Get-ChildItem -LiteralPath $thumbDir -File | Select-Object -ExpandProperty Name } else { })
-        $editFiles = @(if (Test-Path $editDir) { Get-ChildItem -LiteralPath $editDir -File | Select-Object -ExpandProperty Name } else { })
-        $thumbFilesSet = New-Object System.Collections.Generic.HashSet[string]($thumbFiles, [System.StringComparer]::OrdinalIgnoreCase)
-        $editFilesSet = New-Object System.Collections.Generic.HashSet[string]($editFiles, [System.StringComparer]::OrdinalIgnoreCase)
+        $thumbFilesSet = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        $thumbFiles = if (Test-Path $thumbDir) { Get-ChildItem -LiteralPath $thumbDir -File | Select-Object -ExpandProperty Name } else { @() }
+        foreach ($f in $thumbFiles) { [void]$thumbFilesSet.Add($f) }
+
+        $editFilesSet = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        $editFiles = if (Test-Path $editDir) { Get-ChildItem -LiteralPath $editDir -File | Select-Object -ExpandProperty Name } else { @() }
+        foreach ($f in $editFiles) { [void]$editFilesSet.Add($f) }
 
         $videos = Get-VideoFiles -projectFolder $folder
         $projAllNames = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
@@ -592,8 +595,13 @@ function Update-New-Thumbnails {
 
         $thumbDir = Join-Path $folder.FullName "Thumbnails"
         $editDir = Join-Path $folder.FullName "Edit Thumbnails"
-        $thumbFilesSet = New-Object System.Collections.Generic.HashSet[string](@(if (Test-Path $thumbDir) { Get-ChildItem -LiteralPath $thumbDir -File | Select-Object -ExpandProperty Name } else { }), [System.StringComparer]::OrdinalIgnoreCase)
-        $editFilesSet = New-Object System.Collections.Generic.HashSet[string](@(if (Test-Path $editDir) { Get-ChildItem -LiteralPath $editDir -File | Select-Object -ExpandProperty Name } else { }), [System.StringComparer]::OrdinalIgnoreCase)
+        $thumbFilesSet = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        $thumbFiles = if (Test-Path $thumbDir) { Get-ChildItem -LiteralPath $thumbDir -File | Select-Object -ExpandProperty Name } else { @() }
+        foreach ($f in $thumbFiles) { [void]$thumbFilesSet.Add($f) }
+
+        $editFilesSet = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        $editFiles = if (Test-Path $editDir) { Get-ChildItem -LiteralPath $editDir -File | Select-Object -ExpandProperty Name } else { @() }
+        foreach ($f in $editFiles) { [void]$editFilesSet.Add($f) }
 
         $videos = Get-VideoFiles -projectFolder $folder
         $videoBasenames = $videos | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) }
