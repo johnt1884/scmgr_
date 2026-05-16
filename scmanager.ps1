@@ -1,6 +1,7 @@
 # sc_manager.ps1 - Unified SC Utilities and Shortcut Manager
 
-$videoExtensions = @("*.mp4", "*.avi", "*.mov", "*.mkv")
+$videoExtensions = @("*.mp4", "*.mkv", "*.avi", "*.mov", "*.wmv", "*.flv", "*.webm")
+$imageExtensions = @(".jpg", ".jpeg", ".png", ".webp")
 $thumbWidth = 256
 $thumbHeight = 256
 $dbFile = "shortcut_db.txt"
@@ -21,14 +22,10 @@ function Get-ProjectFolders {
 
 function Get-VideoFiles {
     param($projectFolder)
-    $videoFiles = @()
     $extensions = $videoExtensions | ForEach-Object { $_.Substring(1).ToLower() }
-    $videoFiles += Get-ChildItem -LiteralPath $projectFolder.FullName -File | Where-Object { $extensions -contains $_.Extension.ToLower() }
-    foreach ($subfolder in @("Landscape", "Landscape Rotate", "Edit")) {
-        $subfolderPath = Join-Path $projectFolder.FullName $subfolder
-        if (Test-Path -LiteralPath $subfolderPath) {
-            $videoFiles += Get-ChildItem -LiteralPath $subfolderPath -File | Where-Object { $extensions -contains $_.Extension.ToLower() }
-        }
+    $videoFiles = Get-ChildItem -LiteralPath $projectFolder.FullName -File -Recurse | Where-Object {
+        ($extensions -contains $_.Extension.ToLower()) -and
+        ($_.FullName -notmatch '[\\/](thumbnails|edit thumbnails)[\\/]')
     }
     return $videoFiles | Sort-Object FullName -Unique
 }
@@ -85,18 +82,18 @@ function Show-Menu {
     Write-Host ""
     Write-Host "   UPDATES"
     Write-Host "   ------------------"
-    Write-Host "   01. Update scdate.txt (newest shortcut date)"
-    Write-Host "   02. Update scdata.txt (shortcut listing)"
-    Write-Host "   03. Generate scnew.txt (for Load SC New)"
-    Write-Host "   04. Update selections.txt (for each project)"
-    Write-Host "   05. Perform ALL updates (1-4)"
+    Write-Host "   1. Update scdate.txt (newest shortcut date)"
+    Write-Host "   2. Update scdata.txt (shortcut listing)"
+    Write-Host "   3. Generate scnew.txt (for Load SC New)"
+    Write-Host "   4. Update selections.txt (for each project)"
+    Write-Host "   5. Perform ALL updates (1-4)"
     Write-Host ""
     Write-Host "   TOOLS"
     Write-Host "   ------------------"
-    Write-Host "   06. Check Thumbnails (All, Fast)"
-    Write-Host "   07. Check Thumbnails (All, Dimension Check)"
-    Write-Host "   08. Update New Thumbnails"
-    Write-Host "   09. Shortcut Manager"
+    Write-Host "   6. Check Thumbnails (All, Fast)"
+    Write-Host "   7. Check Thumbnails (All, Dimension Check)"
+    Write-Host "   8. Update New Thumbnails"
+    Write-Host "   9. Shortcut Manager"
     Write-Host "   10. Check for empty videos"
     Write-Host "   11. Check for broken shortcuts"
     Write-Host ""
@@ -367,352 +364,300 @@ function Update-Selections {
 
 function Check-Thumbnails {
     param($Fast = $false)
-    # Ported from check_thumbnails.ps1
 
     $allProjectFolders = Get-ProjectFolders
-    $overallIssues = @{ MissingRegular = 0; MissingEdit = 0; WrongDimensions = 0; Obsolete = 0 }
-    $fixCommands = @()
-    $obsoleteFiles = New-Object System.Collections.Generic.List[string]
-
-    Write-Host "`nStarting thumbnail check for all project folders..." -ForegroundColor Yellow
-
     $totalFolders = $allProjectFolders.Count
-    if ($totalFolders -eq 0) {
-        Write-Host "`nNo project folders found." -ForegroundColor Yellow
-        return
-    }
-    $currentFolderIndex = 0
+    if ($totalFolders -eq 0) { Write-Host "`nNo project folders found." -ForegroundColor Yellow; return }
 
+    $stats = @{
+        total_videos = 0; total_unique_names = 0
+        total_found_main_slots = 0; total_found_edit_slots = 0
+        total_unique_main_files = 0; total_unique_edit_files = 0
+        total_wrong_dimensions = 0
+    }
+    $projectReports = New-Object System.Collections.Generic.List[PSObject]
+    $generationQueue = @{} # video_path -> [project_path, gen_main, missing_edits_array, force_ideal]
+    $obsoleteImages = New-Object System.Collections.Generic.List[string]
+
+    Write-Host ""
+    $currentFolderIndex = 0
     foreach ($folder in $allProjectFolders) {
         $currentFolderIndex++
         $percent = [math]::Floor(($currentFolderIndex / $totalFolders) * 100)
-        Write-Host -NoNewline "`r[$percent%] Processing projects..." -ForegroundColor Yellow
+        Write-Host -NoNewline "`r[$([string]$percent).PadLeft(3)%] Processing projects..." -ForegroundColor Yellow
+
+        $thumbDir = Join-Path $folder.FullName "Thumbnails"
+        $editDir = Join-Path $folder.FullName "Edit Thumbnails"
+
+        $thumbFiles = @(if (Test-Path $thumbDir) { Get-ChildItem -LiteralPath $thumbDir -File | Select-Object -ExpandProperty Name } else { })
+        $editFiles = @(if (Test-Path $editDir) { Get-ChildItem -LiteralPath $editDir -File | Select-Object -ExpandProperty Name } else { })
+        $thumbFilesSet = New-Object System.Collections.Generic.HashSet[string]($thumbFiles, [System.StringComparer]::OrdinalIgnoreCase)
+        $editFilesSet = New-Object System.Collections.Generic.HashSet[string]($editFiles, [System.StringComparer]::OrdinalIgnoreCase)
 
         $videos = Get-VideoFiles -projectFolder $folder
-        $videoBasenames = $videos | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) }
-        $regularThumbsDir = Join-Path $folder.FullName "Thumbnails"
-        $editThumbsDir = Join-Path $folder.FullName "Edit Thumbnails"
+        $projAllNames = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        $projFoundMainNames = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        $projFoundEditSlotsSet = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        $projFoundMainSlots = 0; $projFoundEditSlots = 0
+        $usedThumbFiles = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        $usedEditFiles = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
 
-        $projectIssues = @{
-            MissingRegular = New-Object System.Collections.Generic.List[string]
-            MissingEdit = New-Object System.Collections.Generic.List[string]
-            WrongDimensions = New-Object System.Collections.Generic.List[string]
-            ObsoleteRegular = New-Object System.Collections.Generic.List[string]
-            ObsoleteEdit = New-Object System.Collections.Generic.List[string]
+        if (-not $videos) {
+            foreach ($f in $thumbFiles) { $obsoleteImages.Add((Join-Path $thumbDir $f)) }
+            foreach ($f in $editFiles) { $obsoleteImages.Add((Join-Path $editDir $f)) }
+            continue
         }
 
-        # Fast existence check using HashSets
-        $thumbFilesSet = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-        if (Test-Path -LiteralPath $regularThumbsDir) {
-            Get-ChildItem -LiteralPath $regularThumbsDir -Filter *.jpg | ForEach-Object { [void]$thumbFilesSet.Add($_.Name) }
-        }
-        $editFilesSet = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-        if (Test-Path -LiteralPath $editThumbsDir) {
-            Get-ChildItem -LiteralPath $editThumbsDir -Filter *.jpg | ForEach-Object { [void]$editFilesSet.Add($_.Name) }
-        }
-
-        # 1. Missing regular
         foreach ($video in $videos) {
-            $thumbName = "$([System.IO.Path]::GetFileNameWithoutExtension($video.Name)).jpg"
-            if (-not $thumbFilesSet.Contains($thumbName)) { $projectIssues.MissingRegular.Add($video.FullName) }
-        }
+            $videoName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
+            [void]$projAllNames.Add($videoName)
 
-        # 2. Missing edit
-        foreach ($video in $videos) {
-            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
-            $isMissingAll = $true
+            # Check Main
+            $foundMain = $null
+            foreach ($ext in $imageExtensions) {
+                if ($thumbFilesSet.Contains("$videoName$ext")) { $foundMain = "$videoName$ext"; break }
+            }
+
+            # Check Edits
+            $foundEditIndices = @()
             for ($i = 1; $i -le 10; $i++) {
-                if ($editFilesSet.Contains("${baseName}_${i}.jpg")) { $isMissingAll = $false; break }
-            }
-            if ($isMissingAll) { $projectIssues.MissingEdit.Add($video.FullName) }
-        }
-
-        # 3. Wrong dims and obsolete
-        if (Test-Path -LiteralPath $regularThumbsDir) {
-            Get-ChildItem -LiteralPath $regularThumbsDir -Filter *.jpg -File | ForEach-Object {
-                $thumbBasename = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
-                if ($thumbBasename -in $videoBasenames) {
-                    if (-not $Fast) {
-                        try {
-                            $img = [System.Drawing.Image]::FromFile($_.FullName)
-                            $correctedDims = Get-CorrectedImageDimensions -image $img
-                            if ($correctedDims.Width -gt $thumbWidth -or $correctedDims.Height -gt $thumbHeight) { $projectIssues.WrongDimensions.Add($_.FullName) }
-                        } finally { if ($img) { $img.Dispose() } }
+                foreach ($ext in $imageExtensions) {
+                    if ($editFilesSet.Contains("${videoName}_${i}$ext")) {
+                        $foundEditIndices += $i
+                        [void]$projFoundEditSlotsSet.Add("${videoName}_${i}")
+                        [void]$usedEditFiles.Add("${videoName}_${i}$ext")
+                        break
                     }
-                } else { $projectIssues.ObsoleteRegular.Add($_.FullName) }
-            }
-        }
-        if (Test-Path -LiteralPath $editThumbsDir) {
-            Get-ChildItem -LiteralPath $editThumbsDir -Filter *.jpg -File | ForEach-Object {
-                $videoBasename = Find-VideoBasenameForEditThumbnail -thumbName $_.Name -videoBasenames $videoBasenames
-                if ($videoBasename -ne $null) {
-                    if (-not $Fast) {
-                        try {
-                            $img = [System.Drawing.Image]::FromFile($_.FullName)
-                            $correctedDims = Get-CorrectedImageDimensions -image $img
-                            if ($correctedDims.Width -gt $thumbWidth -or $correctedDims.Height -gt $thumbHeight) { $projectIssues.WrongDimensions.Add($_.FullName) }
-                        } finally { if ($img) { $img.Dispose() } }
-                    }
-                } else { $projectIssues.ObsoleteEdit.Add($_.FullName) }
-            }
-        }
-
-        # Reporting and Fix generation
-        $totalProjectIssues = $projectIssues.MissingRegular.Count + $projectIssues.MissingEdit.Count + $projectIssues.WrongDimensions.Count + $projectIssues.ObsoleteRegular.Count + $projectIssues.ObsoleteEdit.Count
-        if ($totalProjectIssues -gt 0) {
-            Write-Host "`nProject: $($folder.Name)" -ForegroundColor Cyan
-            if ($projectIssues.MissingRegular.Count -gt 0) {
-                Write-Host " - Missing Regular Thumbnails: $($projectIssues.MissingRegular.Count)" -ForegroundColor Red
-                $overallIssues.MissingRegular += $projectIssues.MissingRegular.Count
-                $fixCommands += 'if not exist "' + $regularThumbsDir + '" mkdir "' + $regularThumbsDir + '"'
-                $projectIssues.MissingRegular | ForEach-Object {
-                    $thumbPath = Join-Path $regularThumbsDir "$([System.IO.Path]::GetFileNameWithoutExtension($_)).jpg"
-                    $fixCommands += "ffmpeg -y -noautorotate -i ""$_"" -ss 00:00:02.000 -update 1 -frames:v 1 -vf ""scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease"" -map_metadata -1 ""$thumbPath"""
                 }
             }
-            if ($projectIssues.MissingEdit.Count -gt 0) {
-                Write-Host " - Missing Edit Mode Thumbnails: $($projectIssues.MissingEdit.Count)" -ForegroundColor Red
-                $overallIssues.MissingEdit += $projectIssues.MissingEdit.Count
-                $fixCommands += 'if not exist "' + $editThumbsDir + '" mkdir "' + $editThumbsDir + '"'
-                $projectIssues.MissingEdit | ForEach-Object {
-                    $videoPath = $_
-                    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($videoPath)
+
+            if ($foundMain) {
+                $projFoundMainSlots++
+                [void]$projFoundMainNames.Add($videoName)
+                [void]$usedThumbFiles.Add($foundMain)
+            }
+
+            $projFoundEditSlots += $foundEditIndices.Count
+
+            # Dimension Check logic (Simplified for PS)
+            $needsMainFix = $false
+            $wrongDimEdits = @()
+            if (-not $Fast) {
+                # [Simplified dimension check similar to existing PS logic]
+                if ($foundMain) {
                     try {
-                        $durationStr = ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -i $videoPath
+                        $img = [System.Drawing.Image]::FromFile((Join-Path $thumbDir $foundMain))
+                        $dims = Get-CorrectedImageDimensions -image $img
+                        if ($dims.Width -gt $thumbWidth -or $dims.Height -gt $thumbHeight) { $needsMainFix = $true; $stats.total_wrong_dimensions++ }
+                    } finally { if ($img) { $img.Dispose() } }
+                }
+                foreach ($idx in $foundEditIndices) {
+                    # Actually we need the filename... find it again or store it.
+                    foreach ($ext in $imageExtensions) {
+                        $f = "${videoName}_${idx}$ext"
+                        if ($editFilesSet.Contains($f)) {
+                            try {
+                                $img = [System.Drawing.Image]::FromFile((Join-Path $editDir $f))
+                                $dims = Get-CorrectedImageDimensions -image $img
+                                if ($dims.Width -gt $thumbWidth -or $dims.Height -gt $thumbHeight) { $wrongDimEdits += $idx; $stats.total_wrong_dimensions++ }
+                            } finally { if ($img) { $img.Dispose() } }
+                            break
+                        }
+                    }
+                }
+            }
+
+            $missingEdits = (1..10 | Where-Object { $_ -notin $foundEditIndices })
+            $genMain = ($foundMain -eq $null) -or $needsMainFix
+            $genEdits = ($missingEdits + $wrongDimEdits) | Sort-Object -Unique
+
+            if ($genMain -or $genEdits) {
+                $generationQueue[$video.FullName] = @($folder.FullName, $genMain, $genEdits, (-not $Fast -and ($needsMainFix -or $wrongDimEdits)))
+            }
+        }
+
+        $stats.total_videos += $videos.Count
+        $stats.total_unique_names += $projAllNames.Count
+        $stats.total_found_main_slots += $projFoundMainSlots
+        $stats.total_found_edit_slots += $projFoundEditSlots
+        $stats.total_unique_main_files += $projFoundMainNames.Count
+        $stats.total_unique_edit_files += $projFoundEditSlotsSet.Count
+
+        foreach ($f in $thumbFiles) { if (-not $usedThumbFiles.Contains($f)) { $obsoleteImages.Add((Join-Path $thumbDir $f)) } }
+        foreach ($f in $editFiles) { if (-not $usedEditFiles.Contains($f)) { $obsoleteImages.Add((Join-Path $editDir $f)) } }
+
+        $projectReports.Add([PSCustomObject]@{
+            name = $folder.Name
+            missing = ($projAllNames.Count - $projFoundMainNames.Count) + ($projAllNames.Count * 10 - $projFoundEditSlotsSet.Count)
+        })
+    }
+
+    Write-Host "`nScan complete.`n"
+    $totalMissing = ($stats.total_unique_names - $stats.total_unique_main_files) + ($stats.total_unique_names * 10 - $stats.total_unique_edit_files)
+
+    $summary = "Total number of projects scanned: $totalFolders`n" +
+               "Total number of videos found: $($stats.total_videos) ($($stats.total_unique_names) unique names)`n" +
+               "Main Thumbs: Found $($stats.total_found_main_slots)/$($stats.total_videos) ($($stats.total_unique_main_files) unique files)`n" +
+               "Edit Thumbs: Found $($stats.total_found_edit_slots)/$($stats.total_videos * 10) ($($stats.total_unique_edit_files) unique files)`n"
+    if (-not $Fast) { $summary += "Images with wrong dimensions: $($stats.total_wrong_dimensions)`n" }
+    $summary += "Total number of missing images: $totalMissing`n" +
+                "Total number of obsolete images: $($obsoleteImages.Count)`n"
+
+    Write-Host $summary
+
+    if ($totalMissing -gt 0) {
+        $ans = Read-Host "Would you like to print a list of projects with missing images? (y/n)"
+        if ($ans -eq 'y') {
+            foreach ($pr in $projectReports) { if ($pr.missing -gt 0) { Write-Host "  - [$($pr.name)] Missing: $($pr.missing)" } }
+        }
+    }
+
+    if ($obsoleteImages.Count -gt 0) {
+        $ans = Read-Host "Would you like to delete $($obsoleteImages.Count) obsolete images? (y/n)"
+        if ($ans -eq 'y') {
+            foreach ($img in $obsoleteImages) { if (Test-Path $img) { Remove-Item -LiteralPath $img -Force } }
+            Write-Host "Deleted $($obsoleteImages.Count) obsolete images." -ForegroundColor Green
+        }
+    }
+
+    if ($generationQueue.Count -gt 0) {
+        $genMainCount = ($generationQueue.Values | Where-Object { $_[1] }).Count
+        $genEditCount = ($generationQueue.Values | Where-Object { $_[2] }).Count
+        Write-Host "Eligible for thumbnail generation:`n- $genMainCount Main, $genEditCount Edit videos"
+
+        $ans = Read-Host "Would you like to generate a 'fix_thumbnails.bat' script? (y/n)"
+        if ($ans -eq 'y') {
+            $fixCommands = New-Object System.Collections.Generic.List[string]
+            foreach ($vPath in $generationQueue.Keys) {
+                $data = $generationQueue[$vPath]
+                $projDir = $data[0]
+                $genM = $data[1]
+                $missE = $data[2]
+                $videoName = [System.IO.Path]::GetFileNameWithoutExtension($vPath)
+                $vPathBatch = $vPath.Replace('%', '%%')
+
+                if ($genM) {
+                    $tDir = Join-Path $projDir "Thumbnails"
+                    $fixCommands.Add("if not exist `"$($tDir.Replace('%', '%%'))`" mkdir `"$($tDir.Replace('%', '%%'))`"")
+                    $tPath = (Join-Path $tDir "$videoName.jpg").Replace('%', '%%')
+                    $fixCommands.Add("ffmpeg -y -noautorotate -i `"$vPathBatch`" -ss 00:00:02.000 -update 1 -frames:v 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease`" -map_metadata -1 `"$tPath`" >nul 2>&1")
+                }
+                if ($missE) {
+                    $eDir = Join-Path $projDir "Edit Thumbnails"
+                    $fixCommands.Add("if not exist `"$($eDir.Replace('%', '%%'))`" mkdir `"$($eDir.Replace('%', '%%'))`"")
+                    try {
+                        $durationStr = ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -i $vPath
                         $durationInt = [math]::Floor([double]::Parse($durationStr))
                         if ($durationInt -eq 0) { $durationInt = 10 }
                         $interval = [math]::Floor($durationInt / 10)
                         if ($interval -eq 0) { $interval = 1 }
-                        for ($i = 1; $i -le 10; $i++) {
-                            $timestamp = ($i - 1) * $interval
-                            $thumbPath = Join-Path $editThumbsDir "${baseName}_${i}.jpg"
-                            $fixCommands += "ffmpeg -y -noautorotate -ss $timestamp -i ""$videoPath"" -update 1 -vframes 1 -vf ""scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease"" -map_metadata -1 ""$thumbPath"" >nul 2>&1"
+                        foreach ($idx in $missE) {
+                            $timestamp = ($idx - 1) * $interval
+                            $tPath = (Join-Path $eDir "${videoName}_${idx}.jpg").Replace('%', '%%')
+                            $fixCommands.Add("ffmpeg -y -noautorotate -ss $timestamp -i `"$vPathBatch`" -update 1 -vframes 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease`" -map_metadata -1 `"$tPath`" >nul 2>&1")
                         }
                     } catch {}
                 }
             }
-            if ($projectIssues.WrongDimensions.Count -gt 0) {
-                Write-Host " - Thumbnails with Wrong Dimensions: $($projectIssues.WrongDimensions.Count)" -ForegroundColor Red
-                $overallIssues.WrongDimensions += $projectIssues.WrongDimensions.Count
-                foreach ($thumbPath in $projectIssues.WrongDimensions) {
-                    $thumbName = [System.IO.Path]::GetFileName($thumbPath)
-                    $video = $null
-                    if ($thumbPath.Contains('Edit Thumbnails')) {
-                        $baseName = Find-VideoBasenameForEditThumbnail -thumbName $thumbName -videoBasenames $videoBasenames
-                        $video = $videos | Where-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $baseName } | Select-Object -First 1
-                    } else {
-                        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($thumbName)
-                        $video = $videos | Where-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) -eq $baseName } | Select-Object -First 1
-                    }
-                    if ($video) {
-                        if ($thumbPath.Contains('Edit Thumbnails')) {
-                            try {
-                                $timestampIndex = $thumbName.Substring($thumbName.LastIndexOf('_') + 1).Split('.')[0] - 1
-                                $durationStr = ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -i $video.FullName
-                                $durationInt = [math]::Floor([double]::Parse($durationStr))
-                                if ($durationInt -eq 0) { $durationInt = 10 }
-                                $interval = [math]::Floor($durationInt / 10)
-                                if ($interval -eq 0) { $interval = 1 }
-                                $timestamp = $timestampIndex * $interval
-                                $fixCommands += "ffmpeg -y -noautorotate -ss $timestamp -i ""$($video.FullName)"" -update 1 -vframes 1 -vf ""scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease"" -map_metadata -1 ""$thumbPath"" >nul 2>&1"
-                            } catch {}
-                        } else {
-                            $fixCommands += "ffmpeg -y -noautorotate -i ""$($video.FullName)"" -ss 00:00:02.000 -update 1 -frames:v 1 -vf ""scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease"" -map_metadata -1 ""$thumbPath"""
-                        }
-                    } else { $fixCommands += 'if exist "' + $thumbPath + '" del "' + $thumbPath + '"' }
-                }
-            }
-            if ($projectIssues.ObsoleteRegular.Count -gt 0) {
-                Write-Host " - Obsolete Regular Thumbnails (No corresponding video): $($projectIssues.ObsoleteRegular.Count)" -ForegroundColor Red
-                $projectIssues.ObsoleteRegular | ForEach-Object {
-                    $overallIssues.Obsolete++
-                    $obsoleteFiles.Add($_)
-                    $fixCommands += 'if exist "' + $_ + '" del "' + $_ + '"'
-                }
-            }
-            if ($projectIssues.ObsoleteEdit.Count -gt 0) {
-                Write-Host " - Obsolete Edit Thumbnails (No corresponding video): $($projectIssues.ObsoleteEdit.Count)" -ForegroundColor Red
-                $projectIssues.ObsoleteEdit | ForEach-Object {
-                    $overallIssues.Obsolete++
-                    $obsoleteFiles.Add($_)
-                    $fixCommands += 'if exist "' + $_ + '" del "' + $_ + '"'
-                }
-            }
-        }
-    }
-
-    Write-Host "`r[100%] Scan complete.                " -ForegroundColor Yellow
-
-    Write-Host "`n=================================================="
-    Write-Host "Overall Summary" -ForegroundColor Yellow
-    Write-Host "=================================================="
-    $totalOverallIssues = $overallIssues.MissingRegular + $overallIssues.MissingEdit + $overallIssues.WrongDimensions + $overallIssues.Obsolete
-
-    if ($totalOverallIssues -gt 0) {
-        Write-Host "Missing Regular Thumbnails: $($overallIssues.MissingRegular)"
-        Write-Host "Missing Edit Sets:          $($overallIssues.MissingEdit)"
-        Write-Host "Wrong Dimensions:           $($overallIssues.WrongDimensions)"
-        Write-Host "Obsolete Thumbnails:        $($overallIssues.Obsolete)"
-
-        if ($obsoleteFiles.Count -gt 0) {
-            $delChoice = Read-Host "`n$($obsoleteFiles.Count) obsolete thumbnails (no corresponding video) found. Delete them now? (y/n)"
-            if ($delChoice -eq 'y') {
-                foreach ($file in $obsoleteFiles) {
-                    if (Test-Path -LiteralPath $file) {
-                        Remove-Item -LiteralPath $file -Force
-                        Write-Host "Deleted: $file" -ForegroundColor Gray
-                    }
-                }
-                Write-Host "Obsolete thumbnails deleted." -ForegroundColor Green
-                # Clear obsolete from overall issues since they are gone
-                $overallIssues.Obsolete = 0
-            }
-        }
-
-        $choice = Read-Host "`nIssues found. Would you like to generate a 'fix_thumbnails.bat' script to resolve them? (y/n)"
-        if ($choice -eq 'y') {
-            $fixScriptContent = "@echo off`r`nsetlocal enabledelayedexpansion`r`necho Starting thumbnail fix process...`r`n" + ($fixCommands -join "`r`n") + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
-            Set-Content -LiteralPath "fix_thumbnails.bat" -Value $fixScriptContent
+            $fixScriptContent = "@echo off`r`necho Starting thumbnail fix process...`r`n" + ($fixCommands | Select-Object -Unique -join "`r`n") + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
+            [System.IO.File]::WriteAllText((Join-Path (Get-Location) "fix_thumbnails.bat"), $fixScriptContent, [System.Text.Encoding]::UTF8)
             Write-Host "`nfix_thumbnails.bat has been generated." -ForegroundColor Green
         }
-    } else { Write-Host "All project thumbnails are in good shape!" -ForegroundColor Green }
+    }
 }
 
 function Update-New-Thumbnails {
-    Write-Host "`nStarting fast thumbnail update for new videos..." -ForegroundColor Yellow
     $allProjectFolders = Get-ProjectFolders
-    $fixCommands = @()
-    $newVideoCount = 0
-    $obsoleteFiles = New-Object System.Collections.Generic.List[string]
-
     $totalFolders = $allProjectFolders.Count
     if ($totalFolders -eq 0) { return }
-    $currentFolderIndex = 0
 
+    $stats = @{ total_videos = 0; total_unique_names = 0; total_found_main_slots = 0; total_found_edit_slots = 0; total_unique_main_files = 0; total_unique_edit_files = 0 }
+    $generationQueue = @{}
+    $obsoleteImages = New-Object System.Collections.Generic.List[string]
+
+    Write-Host "`nStarting fast thumbnail update for new videos..." -ForegroundColor Yellow
+    $currentFolderIndex = 0
     foreach ($folder in $allProjectFolders) {
         $currentFolderIndex++
         $percent = [math]::Floor(($currentFolderIndex / $totalFolders) * 100)
-        Write-Host -NoNewline "`r[$percent%] Processing projects..." -ForegroundColor Yellow
+        Write-Host -NoNewline "`r[$([string]$percent).PadLeft(3)%] Processing projects..." -ForegroundColor Yellow
 
         $scDatePath = Join-Path $folder.FullName "scdate.txt"
         if (-not (Test-Path $scDatePath)) { continue }
-
-        $cutoff = [DateTime]::MinValue
         try {
             $content = (Get-Content $scDatePath -Raw).Trim()
             if ($content.StartsWith('dummy:')) { $content = $content.Substring(6).Trim() }
             $cutoff = [DateTimeOffset]::Parse($content).UtcDateTime
         } catch { continue }
 
+        $thumbDir = Join-Path $folder.FullName "Thumbnails"
+        $editDir = Join-Path $folder.FullName "Edit Thumbnails"
+        $thumbFilesSet = New-Object System.Collections.Generic.HashSet[string](@(if (Test-Path $thumbDir) { Get-ChildItem -LiteralPath $thumbDir -File | Select-Object -ExpandProperty Name } else { }), [System.StringComparer]::OrdinalIgnoreCase)
+        $editFilesSet = New-Object System.Collections.Generic.HashSet[string](@(if (Test-Path $editDir) { Get-ChildItem -LiteralPath $editDir -File | Select-Object -ExpandProperty Name } else { }), [System.StringComparer]::OrdinalIgnoreCase)
+
         $videos = Get-VideoFiles -projectFolder $folder
+        $videoBasenames = $videos | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) }
         $newVideos = $videos | Where-Object { $_.LastWriteTime.ToUniversalTime() -gt $cutoff }
         
-        if ($newVideos) {
-            $regularThumbsDir = Join-Path $folder.FullName "Thumbnails"
-            $editThumbsDir = Join-Path $folder.FullName "Edit Thumbnails"
-
-            # Fast existence check for new videos
-            $thumbFilesSet = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-            if (Test-Path -LiteralPath $regularThumbsDir) {
-                Get-ChildItem -LiteralPath $regularThumbsDir -Filter *.jpg | ForEach-Object { [void]$thumbFilesSet.Add($_.Name) }
-            }
-            $editFilesSet = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-            if (Test-Path -LiteralPath $editThumbsDir) {
-                Get-ChildItem -LiteralPath $editThumbsDir -Filter *.jpg | ForEach-Object { [void]$editFilesSet.Add($_.Name) }
-            }
-
-            # Check for obsolete thumbnails (all scans should do this)
-            $videoBasenames = $videos | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) }
-            $projectObsoleteCount = 0
-            foreach ($f in $thumbFilesSet) {
-                if ([System.IO.Path]::GetFileNameWithoutExtension($f) -notin $videoBasenames) {
-                    $fullP = Join-Path $regularThumbsDir $f
-                    $obsoleteFiles.Add($fullP)
-                    $fixCommands += 'if exist "' + $fullP + '" del "' + $fullP + '"'
-                    $projectObsoleteCount++
-                }
-            }
-            foreach ($f in $editFilesSet) {
-                if ((Find-VideoBasenameForEditThumbnail -thumbName $f -videoBasenames $videoBasenames) -eq $null) {
-                    $fullP = Join-Path $editThumbsDir $f
-                    $obsoleteFiles.Add($fullP)
-                    $fixCommands += 'if exist "' + $fullP + '" del "' + $fullP + '"'
-                    $projectObsoleteCount++
-                }
-            }
-
-            if ($projectObsoleteCount -gt 0) {
-                Write-Host "`nProject: $($folder.Name)" -ForegroundColor Cyan
-                Write-Host " - Obsolete Thumbnails: $projectObsoleteCount" -ForegroundColor Red
-            }
-
-            foreach ($video in $newVideos) {
-                $newVideoCount++
-                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
-                $vPathBatch = $video.FullName.Replace('%', '%%')
-
-                # Check Regular Thumbnail
-        if (-not $thumbFilesSet.Contains("$baseName.jpg")) {
-                    $fixCommands += "if not exist `"$($regularThumbsDir.Replace('%', '%%'))`" mkdir `"$($regularThumbsDir.Replace('%', '%%'))`""
-            $tPathBatch = (Join-Path $regularThumbsDir "$baseName.jpg").Replace('%', '%%')
-                    $fixCommands += "ffmpeg -y -noautorotate -i `"$vPathBatch`" -ss 00:00:02.000 -update 1 -frames:v 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease`" -map_metadata -1 `"$tPathBatch`" >nul 2>&1"
-                }
-
-                # Check Edit Thumbnails
-                $missingEdit = $false
+        # Obsolete Check
+        $usedThumbFiles = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        $usedEditFiles = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($vName in $videoBasenames) {
+            foreach ($ext in $imageExtensions) {
+                if ($thumbFilesSet.Contains("$vName$ext")) { [void]$usedThumbFiles.Add("$vName$ext") }
                 for ($i = 1; $i -le 10; $i++) {
-            if (-not $editFilesSet.Contains("${baseName}_${i}.jpg")) {
-                        $missingEdit = $true
-                        break
-                    }
+                    if ($editFilesSet.Contains("${vName}_${i}$ext")) { [void]$usedEditFiles.Add("${vName}_${i}$ext") }
                 }
+            }
+        }
+        foreach ($f in $thumbFilesSet) { if (-not $usedThumbFiles.Contains($f)) { $obsoleteImages.Add((Join-Path $thumbDir $f)) } }
+        foreach ($f in $editFilesSet) { if (-not $usedEditFiles.Contains($f)) { $obsoleteImages.Add((Join-Path $editDir $f)) } }
 
-                if ($missingEdit) {
-                    $fixCommands += "if not exist `"$($editThumbsDir.Replace('%', '%%'))`" mkdir `"$($editThumbsDir.Replace('%', '%%'))`""
+        if ($newVideos) {
+            foreach ($video in $newVideos) {
+                $videoName = [System.IO.Path]::GetFileNameWithoutExtension($video.Name)
+                $foundMain = $null
+                foreach ($ext in $imageExtensions) { if ($thumbFilesSet.Contains("$videoName$ext")) { $foundMain = "$videoName$ext"; break } }
+                $missE = @()
+                for ($i = 1; $i -le 10; $i++) {
+                    $found = $false
+                    foreach ($ext in $imageExtensions) { if ($editFilesSet.Contains("${videoName}_${i}$ext")) { $found = $true; break } }
+                    if (-not $found) { $missE += $i }
+                }
+                if (($foundMain -eq $null) -or $missE) { $generationQueue[$video.FullName] = @($folder.FullName, ($foundMain -eq $null), $missE, $false) }
+            }
+        }
+    }
+
+    Write-Host "`nScan complete.`n"
+    if ($obsoleteImages.Count -gt 0) {
+        $ans = Read-Host "Would you like to delete $($obsoleteImages.Count) obsolete images? (y/n)"
+        if ($ans -eq 'y') { foreach ($img in $obsoleteImages) { if (Test-Path $img) { Remove-Item -LiteralPath $img -Force } } }
+    }
+
+    if ($generationQueue.Count -gt 0) {
+        $ans = Read-Host "Eligible for generation: $($generationQueue.Count) videos. Generate 'fix_thumbnails.bat'? (y/n)"
+        if ($ans -eq 'y') {
+            $fixCommands = New-Object System.Collections.Generic.List[string]
+            foreach ($vPath in $generationQueue.Keys) {
+                $data = $generationQueue[$vPath]; $projDir = $data[0]; $genM = $data[1]; $missE = $data[2]; $vName = [System.IO.Path]::GetFileNameWithoutExtension($vPath); $vPathBatch = $vPath.Replace('%', '%%')
+                if ($genM) {
+                    $tDir = Join-Path $projDir "Thumbnails"; $fixCommands.Add("if not exist `"$($tDir.Replace('%', '%%'))`" mkdir `"$($tDir.Replace('%', '%%'))`"")
+                    $tPath = (Join-Path $tDir "$vName.jpg").Replace('%', '%%'); $fixCommands.Add("ffmpeg -y -noautorotate -i `"$vPathBatch`" -ss 00:00:02.000 -update 1 -frames:v 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease`" -map_metadata -1 `"$tPath`" >nul 2>&1")
+                }
+                if ($missE) {
+                    $eDir = Join-Path $projDir "Edit Thumbnails"; $fixCommands.Add("if not exist `"$($eDir.Replace('%', '%%'))`" mkdir `"$($eDir.Replace('%', '%%'))`"")
                     try {
-                        $durationStr = ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -i $video.FullName
-                        $durationInt = [math]::Floor([double]::Parse($durationStr))
-                        if ($durationInt -eq 0) { $durationInt = 10 }
-                        $interval = [math]::Floor($durationInt / 10)
-                        if ($interval -eq 0) { $interval = 1 }
-                        for ($i = 1; $i -le 10; $i++) {
-                            $timestamp = ($i - 1) * $interval
-                            $tPathBatch = (Join-Path $editThumbsDir "${baseName}_${i}.jpg").Replace('%', '%%')
-                            $fixCommands += "ffmpeg -y -noautorotate -ss $timestamp -i `"$vPathBatch`" -update 1 -vframes 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease`" -map_metadata -1 `"$tPathBatch`" >nul 2>&1"
-                        }
+                        $durationStr = ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -i $vPath
+                        $durationInt = [math]::Floor([double]::Parse($durationStr)); if ($durationInt -eq 0) { $durationInt = 10 }; $interval = [math]::Floor($durationInt / 10); if ($interval -eq 0) { $interval = 1 }
+                        foreach ($idx in $missE) { $timestamp = ($idx - 1) * $interval; $tPath = (Join-Path $eDir "${vName}_${idx}.jpg").Replace('%', '%%'); $fixCommands.Add("ffmpeg -y -noautorotate -ss $timestamp -i `"$vPathBatch`" -update 1 -vframes 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease`" -map_metadata -1 `"$tPath`" >nul 2>&1") }
                     } catch {}
                 }
             }
-        }
-    }
-
-    Write-Host "`r[100%] Scan complete.                " -ForegroundColor Yellow
-
-    if ($obsoleteFiles.Count -gt 0) {
-        $delChoice = Read-Host "`n$($obsoleteFiles.Count) obsolete thumbnails (no corresponding video) found. Delete them now? (y/n)"
-        if ($delChoice -eq 'y') {
-            foreach ($file in $obsoleteFiles) {
-                if (Test-Path -LiteralPath $file) {
-                    Remove-Item -LiteralPath $file -Force
-                    Write-Host "Deleted: $file" -ForegroundColor Gray
-                }
-            }
-            Write-Host "Obsolete thumbnails deleted." -ForegroundColor Green
-        }
-    }
-
-    if ($fixCommands.Count -gt 0) {
-        Write-Host "`nFound missing or obsolete thumbnails." -ForegroundColor Red
-        $choice = Read-Host "Would you like to generate a 'fix_thumbnails.bat' script to resolve them? (y/n)"
-        if ($choice -eq 'y') {
-            $uniqueFixCommands = $fixCommands | Select-Object -Unique
-            $fixScriptContent = "@echo off`r`necho Starting fast thumbnail fix process...`r`n" + ($uniqueFixCommands -join "`r`n") + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
-            # Ensure we use \r\n and correct encoding
+            $fixScriptContent = "@echo off`r`necho Starting fast thumbnail fix process...`r`n" + ($fixCommands | Select-Object -Unique -join "`r`n") + "`r`necho.`r`necho Thumbnail fix process complete.`r`npause"
             [System.IO.File]::WriteAllText((Join-Path (Get-Location) "fix_thumbnails.bat"), $fixScriptContent, [System.Text.Encoding]::UTF8)
             Write-Host "`nfix_thumbnails.bat has been generated." -ForegroundColor Green
         }
-    } else {
-        Write-Host "`nAll new videos ($newVideoCount) already have thumbnails and no obsolete thumbnails found." -ForegroundColor Green
     }
 }
 
@@ -898,15 +843,15 @@ while ($true) {
     
     foreach ($c in $choiceArray) {
         switch ($c) {
-            { $_ -in "1", "01" } { Update-ScDate }
-            { $_ -in "2", "02" } { Update-ScData }
-            { $_ -in "3", "03" } { Generate-ScNew }
-            { $_ -in "4", "04" } { Update-Selections }
-            { $_ -in "5", "05" } { Update-ScDate; Update-ScData; Generate-ScNew; Update-Selections }
-            { $_ -in "6", "06" } { Check-Thumbnails -Fast $true }
-            { $_ -in "7", "07" } { Check-Thumbnails -Fast $false }
-            { $_ -in "8", "08" } { Update-New-Thumbnails }
-            { $_ -in "9", "09" } { Shortcut-Manager-Menu }
+            "1" { Update-ScDate }
+            "2" { Update-ScData }
+            "3" { Generate-ScNew }
+            "4" { Update-Selections }
+            "5" { Update-ScDate; Update-ScData; Generate-ScNew; Update-Selections }
+            "6" { Check-Thumbnails -Fast $true }
+            "7" { Check-Thumbnails -Fast $false }
+            "8" { Update-New-Thumbnails }
+            "9" { Shortcut-Manager-Menu }
             "10" { Check-EmptyVideos }
             "11" { Check-BrokenShortcutsLive }
             "12" { exit }
