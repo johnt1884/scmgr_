@@ -10,12 +10,9 @@ from datetime import datetime, timezone
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.JPG', '.JPEG', '.PNG', '.WEBP')
-ROTATION_LUA_PATH = r"C:\Bridge\misc\tools\mpv-x86_64-v3-20260418-git-4377cce\portable_config\scripts\autorotate.lua"
-
 LANDSCAPE_TARGET_WIDTH = 342
 PORTRAIT_TARGET_WIDTH = 192
 TARGET_HEIGHT = 256
-FLIP_LUA_PATH = r"C:\Bridge\misc\tools\mpv-x86_64-v3-20260418-git-4377cce\portable_config\scripts\flip.lua"
 
 def get_projects(base_path):
     return [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d)) and not d.startswith('.')]
@@ -113,56 +110,6 @@ def get_image_dimensions(image_path):
     except Exception:
         return 0, 0
 
-def get_crop_params(video_path, nb_frames):
-    """Detect crop parameters (removing black borders) using ffmpeg cropdetect."""
-    if nb_frames <= 0:
-        return None
-    
-    # We'll take a few samples: 20%, 50%, 80%
-    samples = [int(nb_frames * 0.2), int(nb_frames * 0.5), int(nb_frames * 0.8)]
-    crops = []
-    
-    for frame_idx in samples:
-        cmd = [
-            'ffmpeg', '-y', '-i', video_path,
-            '-vf', f"select='eq(n,{frame_idx})',cropdetect=limit=24:round=2",
-            '-frames:v', '1', '-f', 'null', '-'
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            match = re.search(r"crop=(\d+:\d+:\d+:\d+)", result.stderr)
-            if match:
-                crops.append(match.group(1))
-        except Exception:
-            continue
-            
-    if not crops:
-        return None
-        
-    # Return the most common one
-    return max(set(crops), key=crops.count)
-
-def has_black_borders(image_path):
-    """Check if an image has black borders using cropdetect."""
-    w_orig, h_orig = get_image_dimensions(image_path)
-    if w_orig == 0: return False
-    
-    cmd = [
-        'ffmpeg', '-y', '-i', image_path,
-        '-vf', 'cropdetect=limit=24:round=2',
-        '-frames:v', '1', '-f', 'null', '-'
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        match = re.search(r"crop=(\d+):(\d+):(\d+):(\d+)", result.stderr)
-        if match:
-            w, h, x, y = map(int, match.groups())
-            if w < w_orig or h < h_orig:
-                return True
-    except Exception:
-        pass
-    return False
-
 def generate_video_thumbnails(task):
     """Worker function using FFmpeg processes with dimension logic."""
     video_path, project_path, gen_main, missing_edits, *rest = task
@@ -218,15 +165,8 @@ def generate_video_thumbnails(task):
                         existing_images[i] = (edit_path, w, h)
                         break
 
-    # Detect crop parameters
-    crop_str = get_crop_params(video_path, nb_frames)
-    if crop_str:
-        # Extract width and height from crop_str "w:h:x:y"
-        cw, ch, cx, cy = map(int, crop_str.split(':'))
-        is_landscape = cw >= ch
-    else:
-        cw, ch = v_width, v_height
-        is_landscape = v_width >= v_height
+    # Determine landscape based on raw video dimensions
+    is_landscape = v_width >= v_height
 
     # Determine target dimensions for each missing slot
     target_dims = {} # slot_index -> (w, h)
@@ -240,9 +180,9 @@ def generate_video_thumbnails(task):
     for slot in slots_to_generate:
         # Deep Scan fallback: if we are fixing wrong dimensions, use the ideal target
         if force_ideal:
-            if cw > 0 and ch > 0:
-                scale = min(default_max_w / cw, default_max_h / ch)
-                target_dims[slot] = (int(cw * scale), int(ch * scale))
+            if v_width > 0 and v_height > 0:
+                scale = min(default_max_w / v_width, default_max_h / v_height)
+                target_dims[slot] = (int(v_width * scale), int(v_height * scale))
             else:
                 target_dims[slot] = (default_max_w, default_max_h)
             continue
@@ -259,18 +199,13 @@ def generate_video_thumbnails(task):
             # Check if ANY image is present for this video to determine if "all are missing"
             if not existing_images:
                 # ALL missing: use target dimensions whilst maintaining aspect ratio
-                # We need to scale video dimensions to fit into default_w x default_h
-                # whilst keeping aspect ratio.
-                if cw > 0 and ch > 0:
-                    scale = min(default_max_w / cw, default_max_h / ch)
-                    target_dims[slot] = (int(cw * scale), int(ch * scale))
+                if v_width > 0 and v_height > 0:
+                    scale = min(default_max_w / v_width, default_max_h / v_height)
+                    target_dims[slot] = (int(v_width * scale), int(v_height * scale))
                 else:
                     target_dims[slot] = (default_max_w, default_max_h)
             else:
                 # Some are present, but none preceding. 
-                # Requirement says "same dimensions as the preceeding images present"
-                # If no preceding, and some are present, it's ambiguous. 
-                # Let's use the first available one to be consistent with the "series"
                 first_available_slot = min(existing_images.keys())
                 target_dims[slot] = (existing_images[first_available_slot][1], existing_images[first_available_slot][2])
 
@@ -285,10 +220,8 @@ def generate_video_thumbnails(task):
         for (tw, th), slots in groups.items():
             unique_frames = sorted(list(set(all_target_frames[s] for s in slots)))
             select_str = " + ".join([f"eq(n,{idx})" for idx in unique_frames])
-            # Use crop and scale filter to match target dimensions
+            # Use scale filter to match target dimensions
             filter_parts = [f"select='{select_str}'"]
-            if crop_str:
-                filter_parts.append(f"crop={crop_str}")
             filter_parts.append(f"scale={tw}:{th}")
             filter_parts.append("setpts=N/FRAME_RATE/TB")
             
@@ -336,10 +269,7 @@ def generate_video_thumbnails(task):
                 tw, th = target_dims[10]
                 
                 # Build fallback filter
-                fallback_filter = []
-                if crop_str:
-                    fallback_filter.append(f"crop={crop_str}")
-                fallback_filter.append(f"scale={tw}:{th}")
+                fallback_filter = [f"scale={tw}:{th}"]
                 fallback_filter_str = ",".join(fallback_filter)
 
                 # Using -sseof -1 allows seeking to 1 second before end
@@ -818,174 +748,6 @@ def run_empty_video_scan(generate_report=False):
                 print(f"Error deleting {v}: {e}")
         print(f"Deleted {deleted_count} empty videos.")
 
-def run_rotation_and_flip_scan():
-    base_path = os.getcwd()
-    projects = sorted(get_projects(base_path))
-    
-    all_rotation_entries = {} # project_name -> {filename: degree}
-    all_flip_entries = {} # project_name -> {filename: 'hflip'}
-    
-    def clean_filename(fname):
-        return fname.replace('\ufeff', '').strip()
-
-    print("\nScanning projects for rotation and flip data...")
-    for project in projects:
-        project_path = os.path.join(base_path, project)
-        rotation_file = os.path.join(project_path, 'rotation_data.txt')
-        if os.path.exists(rotation_file):
-            rot_entries = {}
-            flip_entries = {}
-            with open(rotation_file, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or ':' not in line: continue
-                    
-                    parts = line.split(':')
-                    filename = clean_filename(parts[0])
-                    try:
-                        degree = int(parts[1])
-                        if degree != 0:
-                            rot_entries[filename] = degree
-                        
-                        if len(parts) > 2 and parts[2].strip().lower() == 'flip':
-                            flip_entries[filename] = 'hflip'
-                    except (ValueError, IndexError):
-                        continue
-            if rot_entries:
-                all_rotation_entries[project] = rot_entries
-            if flip_entries:
-                all_flip_entries[project] = flip_entries
-
-    # --- Rotation Verification ---
-    lua_rot_dict = {}
-    actual_rot_list = []
-    if os.path.exists(ROTATION_LUA_PATH):
-        with open(ROTATION_LUA_PATH, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-            matches = re.findall(r"\['(.+?)'\]\s*=\s*(\d+)", content)
-            for fname, deg in matches:
-                clean_name = clean_filename(fname.rstrip(':'))
-                lua_rot_dict[clean_name] = int(deg)
-                actual_rot_list.append((clean_name, int(deg)))
-
-    missing_rot = []
-    incorrect_rot = []
-    expected_rot_list = []
-    for project in sorted(all_rotation_entries.keys()):
-        for filename, degree in sorted(all_rotation_entries[project].items()):
-            expected_rot_list.append((filename, degree))
-            if filename not in lua_rot_dict:
-                missing_rot.append((project, filename, degree))
-            elif lua_rot_dict[filename] != degree:
-                incorrect_rot.append((project, filename, degree, lua_rot_dict[filename]))
-
-    is_rot_unsorted = actual_rot_list != expected_rot_list
-
-    # --- Flip Verification ---
-    lua_flip_dict = {}
-    actual_flip_list = []
-    if os.path.exists(FLIP_LUA_PATH):
-        with open(FLIP_LUA_PATH, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-            matches = re.findall(r"\['(.+?)'\]\s*=\s*'(.+?)'", content)
-            for fname, val in matches:
-                clean_name = clean_filename(fname)
-                lua_flip_dict[clean_name] = val
-                actual_flip_list.append((clean_name, val))
-
-    missing_flip = []
-    incorrect_flip = []
-    expected_flip_list = []
-    for project in sorted(all_flip_entries.keys()):
-        for filename, val in sorted(all_flip_entries[project].items()):
-            expected_flip_list.append((filename, val))
-            if filename not in lua_flip_dict:
-                missing_flip.append((project, filename, val))
-            elif lua_flip_dict[filename] != val:
-                incorrect_flip.append((project, filename, val, lua_flip_dict[filename]))
-
-    is_flip_unsorted = actual_flip_list != expected_flip_list
-
-    # --- Reporting ---
-    print("\nVerification Results:")
-    print("=====================")
-    
-    issues_found = missing_rot or incorrect_rot or is_rot_unsorted or missing_flip or incorrect_flip or is_flip_unsorted
-    if not issues_found:
-        print("No issues found. Rotation and flip data are up to date and sorted.")
-        return
-
-    if missing_rot:
-        print(f"\nMissing Rotation Entries ({len(missing_rot)}):")
-        for proj, fname, deg in missing_rot: print(f"  [{proj}] {fname}:{deg}")
-    if incorrect_rot:
-        print(f"\nIncorrect Rotation Degrees ({len(incorrect_rot)}):")
-        for proj, fname, exp, act in incorrect_rot: print(f"  [{proj}] {fname}: Expected {exp}, Found {act}")
-    if is_rot_unsorted:
-        print("\nUnsorted or Extra Rotation Entries Detected in autorotate.lua.")
-
-    if missing_flip:
-        print(f"\nMissing Flip Entries ({len(missing_flip)}):")
-        for proj, fname, val in missing_flip: print(f"  [{proj}] {fname}:{val}")
-    if incorrect_flip:
-        print(f"\nIncorrect Flip Values ({len(incorrect_flip)}):")
-        for proj, fname, exp, act in incorrect_flip: print(f"  [{proj}] {fname}: Expected {exp}, Found {act}")
-    if is_flip_unsorted:
-        print("\nUnsorted or Extra Flip Entries Detected in flip.lua.")
-
-    if input("\nWould you like to fix these issues? (y/n): ").lower() == 'y':
-        # Fix Rotation
-        new_rot_content = "local rotations = {\n"
-        for project in sorted(all_rotation_entries.keys()):
-            new_rot_content += f"    -- {project}\n"
-            for filename in sorted(all_rotation_entries[project].keys()):
-                degree = all_rotation_entries[project][filename]
-                new_rot_content += f"    ['{filename}'] = {degree},\n"
-        new_rot_content += "}\n\n"
-        new_rot_content += """mp.register_event("file-loaded", function()
-    local path = mp.get_property("path")
-    if not path then return end
-
-    mp.set_property("video-rotate", 0)
-
-    local filename = path:match("([^/\\\\\\\\]+)$") or path
-
-    if rotations[filename] then
-        mp.set_property("video-rotate", rotations[filename])
-    end
-end)"""
-        try:
-            p = os.path.dirname(ROTATION_LUA_PATH)
-            if p: os.makedirs(p, exist_ok=True)
-            with open(ROTATION_LUA_PATH, 'w', encoding='utf-8') as f: f.write(new_rot_content)
-            print(f"Updated: {ROTATION_LUA_PATH}")
-        except Exception as e: print(f"Error updating rotation LUA: {e}")
-
-        # Fix Flip
-        new_flip_content = "local flips = {\n"
-        for project in sorted(all_flip_entries.keys()):
-            new_flip_content += f"    -- {project}\n"
-            for filename in sorted(all_flip_entries[project].keys()):
-                val = all_flip_entries[project][filename]
-                new_flip_content += f"    ['{filename}'] = '{val}',\n"
-        new_flip_content += "}\n\n"
-        new_flip_content += """mp.register_event("file-loaded", function()
-    local path = mp.get_property("path")
-    local filename = path:match("^.+[\\\\\\\\/](.+)$") or path
-
-    mp.command("vf remove @flip")
-
-    if flips[filename] then
-        local filter = flips[filename]
-        mp.commandv("vf", "add", "@flip:" .. filter)
-    end
-end)"""
-        try:
-            p = os.path.dirname(FLIP_LUA_PATH)
-            if p: os.makedirs(p, exist_ok=True)
-            with open(FLIP_LUA_PATH, 'w', encoding='utf-8') as f: f.write(new_flip_content)
-            print(f"Updated: {FLIP_LUA_PATH}")
-        except Exception as e: print(f"Error updating flip LUA: {e}")
 
 def run_normal_scan(deep_scan=False, generate_report=False):
     base_path = os.getcwd()
@@ -1050,33 +812,27 @@ def run_normal_scan(deep_scan=False, generate_report=False):
             if deep_scan:
                 nb_frames, fps, v_width, v_height = get_video_info(video)
                 if v_width > 0 and v_height > 0:
-                    crop_str = get_crop_params(video, nb_frames)
-                    if crop_str:
-                        cw, ch, cx, cy = map(int, crop_str.split(':'))
-                        is_landscape = cw >= ch
-                    else:
-                        cw, ch = v_width, v_height
-                        is_landscape = v_width >= v_height
+                    is_landscape = v_width >= v_height
 
                     if is_landscape:
                         default_max_w, default_max_h = LANDSCAPE_TARGET_WIDTH, TARGET_HEIGHT
                     else:
                         default_max_w, default_max_h = PORTRAIT_TARGET_WIDTH, TARGET_HEIGHT
 
-                    scale = min(default_max_w / cw, default_max_h / ch)
-                    target_w, target_h = int(cw * scale), int(ch * scale)
+                    scale = min(default_max_w / v_width, default_max_h / v_height)
+                    target_w, target_h = int(v_width * scale), int(v_height * scale)
                     
                     if main_file:
                         main_path = os.path.join(thumb_dir, main_file)
                         w, h = get_image_dimensions(main_path)
-                        if w != target_w or h != target_h or has_black_borders(main_path):
+                        if w != target_w or h != target_h:
                             needs_main_fix = True
                             results['total_wrong_dimensions'] += 1
 
                     for i, f in zip(edit_indices, edit_files_found):
                         edit_path = os.path.join(edit_dir, f)
                         w, h = get_image_dimensions(edit_path)
-                        if w != target_w or h != target_h or has_black_borders(edit_path):
+                        if w != target_w or h != target_h:
                             wrong_dim_edits.append(i)
                             results['total_wrong_dimensions'] += 1
 
@@ -1207,21 +963,30 @@ def run_normal_scan(deep_scan=False, generate_report=False):
 
 def main():
     while True:
-        print("\nSC Utilities & Thumbnail Scanner")
-        print("1. Update scdate.txt (newest shortcut date)")
-        print("2. Update scdata.txt (shortcut listing)")
-        print("3. Generate scnew.txt (for Load SC New)")
-        print("4. Update selections.txt (for each project)")
-        print("5. Perform ALL updates (1-4)")
-        print("6. Shortcut Manager")
-        print("7. Normal Scan (Scan ALL projects for missing thumbnails)")
-        print("8. Deep Scan (Normal + check thumbnail dimensions)")
-        print("9. Verify rotation and flip data")
-        print("10. Check for empty videos")
-        print("11. Check for broken shortcuts (Classic scan)")
-        print("12. Exit")
+        print("\033[1;33m") # Bold Yellow
+        print("======================================")
+        print("   SC Utilities")
+        print("======================================")
+        print("\033[0m") # Reset
 
-        user_input = input("\nEnter choice(s) (e.g., 1, 4 or 7r): ")
+        print() # Padding
+        print("1. Normal Scan (Scan projects for missing and obsolete thumbnails)")
+        print("2. Deep Scan (Scan projects for missing and obsolete or incorrect thumbnails)")
+        print("-" * 38)
+        print("3. Update scdate.txt (newest shortcut date)")
+        print("4. Update scdata.txt (shortcut data)")
+        print("5. Generate scnew.txt (for Load SC New)")
+        print("6. Update selections.txt")
+        print("7. Perform ALL updates (3-7)")
+        print("-" * 38)
+        print("8. Shortcut Manager")
+        print("-" * 38)
+        print("9. Scan for empty videos")
+        print("10. Scan for broken shortcuts")
+        print("-" * 38)
+        print("11. Exit")
+
+        user_input = input("\nEnter choice(s) (e.g., 1, 4 or 1r): ")
         if not user_input.strip(): continue
 
         choices = re.split(r'[ ,]+', user_input.strip())
@@ -1236,22 +1001,21 @@ def main():
                 generate_report = True
                 clean_choice = choice[:-1]
 
-            if clean_choice == '1': update_sc_date()
-            elif clean_choice == '2': update_sc_data()
-            elif clean_choice == '3': generate_sc_new()
-            elif clean_choice == '4': update_selections()
-            elif clean_choice == '5':
+            if clean_choice == '1': run_normal_scan(deep_scan=False, generate_report=generate_report)
+            elif clean_choice == '2': run_normal_scan(deep_scan=True, generate_report=generate_report)
+            elif clean_choice == '3': update_sc_date()
+            elif clean_choice == '4': update_sc_data()
+            elif clean_choice == '5': generate_sc_new()
+            elif clean_choice == '6': update_selections()
+            elif clean_choice == '7':
                 update_sc_date()
                 update_sc_data()
                 generate_sc_new()
                 update_selections()
-            elif clean_choice == '6': run_shortcut_manager_menu()
-            elif clean_choice == '7': run_normal_scan(deep_scan=False, generate_report=generate_report)
-            elif clean_choice == '8': run_normal_scan(deep_scan=True, generate_report=generate_report)
-            elif clean_choice == '9': run_rotation_and_flip_scan()
-            elif clean_choice == '10': run_empty_video_scan(generate_report=generate_report)
-            elif clean_choice == '11': run_broken_shortcuts_scan(generate_report=generate_report)
-            elif clean_choice == '12': return
+            elif clean_choice == '8': run_shortcut_manager_menu()
+            elif clean_choice == '9': run_empty_video_scan(generate_report=generate_report)
+            elif clean_choice == '10': run_broken_shortcuts_scan(generate_report=generate_report)
+            elif clean_choice == '11': return
             else: print(f"Invalid choice: {choice}")
 
 if __name__ == "__main__":
