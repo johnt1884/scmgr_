@@ -384,7 +384,8 @@ function Check-Thumbnails {
     foreach ($folder in $allProjectFolders) {
         $currentFolderIndex++
         $percent = [math]::Floor(($currentFolderIndex / $totalFolders) * 100)
-        Write-Host -NoNewline "`r[$([string]$percent).PadLeft(3)%] Processing projects..." -ForegroundColor Yellow
+        $progress = "{0,3}" -f $percent
+        Write-Host -NoNewline "`r[$progress%] Processing projects..." -ForegroundColor Yellow
 
         $thumbDir = Join-Path $folder.FullName "Thumbnails"
         $editDir = Join-Path $folder.FullName "Edit Thumbnails"
@@ -583,7 +584,8 @@ function Update-New-Thumbnails {
     foreach ($folder in $allProjectFolders) {
         $currentFolderIndex++
         $percent = [math]::Floor(($currentFolderIndex / $totalFolders) * 100)
-        Write-Host -NoNewline "`r[$([string]$percent).PadLeft(3)%] Processing projects..." -ForegroundColor Yellow
+        $progress = "{0,3}" -f $percent
+        Write-Host -NoNewline "`r[$progress%] Processing projects..." -ForegroundColor Yellow
 
         $scDatePath = Join-Path $folder.FullName "scdate.txt"
         if (-not (Test-Path $scDatePath)) { continue }
