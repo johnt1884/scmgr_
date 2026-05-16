@@ -471,11 +471,11 @@ function Check-Thumbnails {
                 }
             }
 
-            $missingEdits = (1..10 | Where-Object { $_ -notin $foundEditIndices })
+            $missingEdits = @(1..10 | Where-Object { $_ -notin $foundEditIndices })
             $genMain = ($foundMain -eq $null) -or $needsMainFix
-            $genEdits = ($missingEdits + $wrongDimEdits) | Sort-Object -Unique
+            $genEdits = @($missingEdits) + @($wrongDimEdits) | Sort-Object -Unique
 
-            if ($genMain -or $genEdits) {
+            if ($genMain -or ($genEdits.Count -gt 0)) {
                 $generationQueue[$video.FullName] = @($folder.FullName, $genMain, $genEdits, (-not $Fast -and ($needsMainFix -or $wrongDimEdits)))
             }
         }
@@ -544,7 +544,7 @@ function Check-Thumbnails {
                     $tDir = Join-Path $projDir "Thumbnails"
                     $fixCommands.Add("if not exist `"$($tDir.Replace('%', '%%'))`" mkdir `"$($tDir.Replace('%', '%%'))`"")
                     $tPath = (Join-Path $tDir "$videoName.jpg").Replace('%', '%%')
-                    $fixCommands.Add("ffmpeg -y -noautorotate -i `"$vPathBatch`" -ss 00:00:02.000 -update 1 -frames:v 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease`" -map_metadata -1 `"$tPath`" >nul 2>&1")
+                    $fixCommands.Add("ffmpeg -y -i `"$vPathBatch`" -ss 00:00:02.000 -update 1 -frames:v 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease,setsar=1`" -q:v 2 -map_metadata -1 `"$tPath`" >nul 2>&1")
                 }
                 if ($missE) {
                     $eDir = Join-Path $projDir "Edit Thumbnails"
@@ -558,7 +558,7 @@ function Check-Thumbnails {
                         foreach ($idx in $missE) {
                             $timestamp = ($idx - 1) * $interval
                             $tPath = (Join-Path $eDir "${videoName}_${idx}.jpg").Replace('%', '%%')
-                            $fixCommands.Add("ffmpeg -y -noautorotate -ss $timestamp -i `"$vPathBatch`" -update 1 -vframes 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease`" -map_metadata -1 `"$tPath`" >nul 2>&1")
+                            $fixCommands.Add("ffmpeg -y -ss $timestamp -i `"$vPathBatch`" -update 1 -vframes 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease,setsar=1`" -q:v 2 -map_metadata -1 `"$tPath`" >nul 2>&1")
                         }
                     } catch {}
                 }
@@ -634,7 +634,7 @@ function Update-New-Thumbnails {
                     foreach ($ext in $imageExtensions) { if ($editFilesSet.Contains("${videoName}_${i}$ext")) { $found = $true; break } }
                     if (-not $found) { $missE += $i }
                 }
-                if (($foundMain -eq $null) -or $missE) { $generationQueue[$video.FullName] = @($folder.FullName, ($foundMain -eq $null), $missE, $false) }
+                if (($foundMain -eq $null) -or ($missE.Count -gt 0)) { $generationQueue[$video.FullName] = @($folder.FullName, ($foundMain -eq $null), $missE, $false) }
             }
         }
     }
@@ -653,14 +653,14 @@ function Update-New-Thumbnails {
                 $data = $generationQueue[$vPath]; $projDir = $data[0]; $genM = $data[1]; $missE = $data[2]; $vName = [System.IO.Path]::GetFileNameWithoutExtension($vPath); $vPathBatch = $vPath.Replace('%', '%%')
                 if ($genM) {
                     $tDir = Join-Path $projDir "Thumbnails"; $fixCommands.Add("if not exist `"$($tDir.Replace('%', '%%'))`" mkdir `"$($tDir.Replace('%', '%%'))`"")
-                    $tPath = (Join-Path $tDir "$vName.jpg").Replace('%', '%%'); $fixCommands.Add("ffmpeg -y -noautorotate -i `"$vPathBatch`" -ss 00:00:02.000 -update 1 -frames:v 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease`" -map_metadata -1 `"$tPath`" >nul 2>&1")
+                    $tPath = (Join-Path $tDir "$vName.jpg").Replace('%', '%%'); $fixCommands.Add("ffmpeg -y -i `"$vPathBatch`" -ss 00:00:02.000 -update 1 -frames:v 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease,setsar=1`" -q:v 2 -map_metadata -1 `"$tPath`" >nul 2>&1")
                 }
                 if ($missE) {
                     $eDir = Join-Path $projDir "Edit Thumbnails"; $fixCommands.Add("if not exist `"$($eDir.Replace('%', '%%'))`" mkdir `"$($eDir.Replace('%', '%%'))`"")
                     try {
                         $durationStr = ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 -i $vPath
                         $durationInt = [math]::Floor([double]::Parse($durationStr)); if ($durationInt -eq 0) { $durationInt = 10 }; $interval = [math]::Floor($durationInt / 10); if ($interval -eq 0) { $interval = 1 }
-                        foreach ($idx in $missE) { $timestamp = ($idx - 1) * $interval; $tPath = (Join-Path $eDir "${vName}_${idx}.jpg").Replace('%', '%%'); $fixCommands.Add("ffmpeg -y -noautorotate -ss $timestamp -i `"$vPathBatch`" -update 1 -vframes 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease`" -map_metadata -1 `"$tPath`" >nul 2>&1") }
+                        foreach ($idx in $missE) { $timestamp = ($idx - 1) * $interval; $tPath = (Join-Path $eDir "${vName}_${idx}.jpg").Replace('%', '%%'); $fixCommands.Add("ffmpeg -y -ss $timestamp -i `"$vPathBatch`" -update 1 -vframes 1 -vf `"scale=${thumbWidth}:${thumbHeight}:force_original_aspect_ratio=decrease,setsar=1`" -q:v 2 -map_metadata -1 `"$tPath`" >nul 2>&1") }
                     } catch {}
                 }
             }
