@@ -109,8 +109,7 @@ def get_image_dimensions(image_path):
 
 def generate_video_thumbnails(task):
     """Worker function using FFmpeg processes with dimension logic."""
-    video_path, project_path, gen_main, missing_edits, *rest = task
-    force_ideal = rest[0] if rest else False
+    video_path, project_path, gen_main, missing_edits = task
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     
     nb_frames, fps, v_width, v_height = get_video_info(video_path)
@@ -137,30 +136,6 @@ def generate_video_thumbnails(task):
     
     if not slots_to_generate:
         return video_path, True
-
-    # Identify existing images for dimension matching
-    existing_images = {} # slot_index -> (path, width, height)
-    
-    # Check for main thumbnail
-    if not gen_main:
-        for ext in IMAGE_EXTENSIONS:
-            main_path = os.path.join(thumb_dir, f"{video_name}{ext}")
-            if os.path.exists(main_path):
-                w, h = get_image_dimensions(main_path)
-                if w > 0:
-                    existing_images[0] = (main_path, w, h)
-                    break
-    
-    # Check for edit thumbnails
-    for i in range(1, 11):
-        if i not in missing_edits:
-            for ext in IMAGE_EXTENSIONS:
-                edit_path = os.path.join(edit_dir, f"{video_name}_{i}{ext}")
-                if os.path.exists(edit_path):
-                    w, h = get_image_dimensions(edit_path)
-                    if w > 0:
-                        existing_images[i] = (edit_path, w, h)
-                        break
 
     # Determine orientation based on raw video dimensions
     is_landscape = v_width >= v_height
@@ -230,7 +205,7 @@ def generate_video_thumbnails(task):
                     # If -sseof -1 fails (e.g. video < 1s), try without seeking
                     cmd_fallback_no_seek = [
                         'ffmpeg', '-y', '-i', video_path,
-                        '-vf', fallback_filter_str, '-frames:v', '1', '-q:v', '2',
+                        '-vf', scale_str, '-frames:v', '1', '-q:v', '2',
                         slot_10_path
                     ]
                     subprocess.run(cmd_fallback_no_seek, capture_output=True)
@@ -801,20 +776,15 @@ def run_normal_scan(deep_scan=False, generate_report=False):
             missing_edits.extend(wrong_dim_edits)
             missing_edits = sorted(list(set(missing_edits)))
             
-            # If fix was triggered by deep scan dimension mismatch, we MUST force matching 
-            # for these specific slots in generate_video_thumbnails.
-            force_ideal = deep_scan and (needs_main_fix or wrong_dim_edits)
-
             if needs_main or missing_edits:
                 if video not in generation_queue:
-                    generation_queue[video] = [project_path, needs_main, missing_edits, force_ideal]
+                    generation_queue[video] = [project_path, needs_main, missing_edits]
                 else:
                     if needs_main: generation_queue[video][1] = True
                     # Combine missing edits
                     existing_missing = set(generation_queue[video][2])
                     existing_missing.update(missing_edits)
                     generation_queue[video][2] = sorted(list(existing_missing))
-                    if force_ideal: generation_queue[video][3] = True
             
             project_videos_report.append({
                 'video': video_rel_path, 'main_thumbnail': main_file is not None,
@@ -893,7 +863,7 @@ def run_normal_scan(deep_scan=False, generate_report=False):
                 print("Error: FFmpeg not found.")
                 return
 
-            tasks = [(path, data[0], data[1], data[2], data[3] if len(data) > 3 else False) for path, data in generation_queue.items()]
+            tasks = [(path, data[0], data[1], data[2]) for path, data in generation_queue.items()]
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(generate_video_thumbnails, task) for task in tasks]
                 for i, future in enumerate(concurrent.futures.as_completed(futures)):
