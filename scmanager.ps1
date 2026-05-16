@@ -898,15 +898,15 @@ while ($true) {
     
     foreach ($c in $choiceArray) {
         switch ($c) {
-            "1", "01" { Update-ScDate }
-            "2", "02" { Update-ScData }
-            "3", "03" { Generate-ScNew }
-            "4", "04" { Update-Selections }
-            "5", "05" { Update-ScDate; Update-ScData; Generate-ScNew; Update-Selections }
-            "6", "06" { Check-Thumbnails -Fast $true }
-            "7", "07" { Check-Thumbnails -Fast $false }
-            "8", "08" { Update-New-Thumbnails }
-            "9", "09" { Shortcut-Manager-Menu }
+            { $_ -in "1", "01" } { Update-ScDate }
+            { $_ -in "2", "02" } { Update-ScData }
+            { $_ -in "3", "03" } { Generate-ScNew }
+            { $_ -in "4", "04" } { Update-Selections }
+            { $_ -in "5", "05" } { Update-ScDate; Update-ScData; Generate-ScNew; Update-Selections }
+            { $_ -in "6", "06" } { Check-Thumbnails -Fast $true }
+            { $_ -in "7", "07" } { Check-Thumbnails -Fast $false }
+            { $_ -in "8", "08" } { Update-New-Thumbnails }
+            { $_ -in "9", "09" } { Shortcut-Manager-Menu }
             "10" { Check-EmptyVideos }
             "11" { Check-BrokenShortcutsLive }
             "12" { exit }
