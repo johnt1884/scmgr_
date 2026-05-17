@@ -7,6 +7,10 @@ import shutil
 import re
 import hashlib
 import tempfile
+try:
+    import win32com.client
+except ImportError:
+    win32com = None
 from datetime import datetime, timezone
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm')
@@ -220,11 +224,29 @@ def is_shortcut(path):
     if path.lower().endswith('.lnk'): return True
     return False
 
+_wscript_shell = None
+def get_wscript_shell():
+    global _wscript_shell
+    if _wscript_shell is None and win32com:
+        try:
+            # We use Dispatch because it's persistent and avoids launching a process
+            _wscript_shell = win32com.client.Dispatch("WScript.Shell")
+        except Exception:
+            pass
+    return _wscript_shell
+
 def get_shortcut_target(path):
     if os.path.islink(path):
         return os.readlink(path)
     if path.lower().endswith('.lnk'):
         if os.name == 'nt':
+            shell = get_wscript_shell()
+            if shell:
+                try:
+                    return shell.CreateShortcut(path).TargetPath
+                except Exception:
+                    pass
+            # Fallback to PowerShell if COM fails or pywin32 is missing
             escaped_path = path.replace("'", "''")
             cmd = ['powershell', '-Command', f"(New-Object -ComObject WScript.Shell).CreateShortcut('{escaped_path}').TargetPath"]
             try:
@@ -237,6 +259,17 @@ def get_shortcut_targets_bulk(paths):
     if not paths: return {}
     results = {}
     if os.name == 'nt':
+        shell = get_wscript_shell()
+        if shell:
+            for p in paths:
+                try:
+                    target = shell.CreateShortcut(p).TargetPath
+                    if target:
+                        results[p] = target
+                except Exception:
+                    pass
+            return results
+
         # Use a temporary file to pass paths to PowerShell to avoid command line length limits
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as tmp:
             for p in paths:
