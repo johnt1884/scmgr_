@@ -271,15 +271,17 @@ def get_shortcut_targets_bulk(paths):
             return results
 
         # Use a temporary file to pass paths to PowerShell to avoid command line length limits
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as tmp:
+        # Use utf-8-sig to ensure PowerShell's Get-Content correctly handles the BOM
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8-sig') as tmp:
             for p in paths:
                 tmp.write(p + '\n')
             tmp_path = tmp.name
 
         try:
             escaped_tmp_path = tmp_path.replace("'", "''")
-            ps_script = f"$s=New-Object -ComObject WScript.Shell; Get-Content '{escaped_tmp_path}' | ForEach-Object {{ try {{ $s.CreateShortcut($_).TargetPath }} catch {{ '' }} }}"
-            cmd = ['powershell', '-Command', ps_script]
+            # Using -LiteralPath and -Encoding UTF8 for maximum compatibility
+            ps_script = f"$s=New-Object -ComObject WScript.Shell; Get-Content -LiteralPath '{escaped_tmp_path}' -Encoding UTF8 | ForEach-Object {{ try {{ $s.CreateShortcut($_).TargetPath }} catch {{ '' }} }}"
+            cmd = ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps_script]
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             targets = result.stdout.splitlines()
             for p, t in zip(paths, targets):
@@ -322,16 +324,20 @@ def update_sc_date():
     base_path = os.getcwd()
     root_sc = os.path.join(base_path, 'sc')
     cached = []
-    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
 
     if os.path.exists(root_sc):
+        print("Processing root sc shortcuts...")
         lnk_paths = [os.path.join(root_sc, f) for f in os.listdir(root_sc) if f.lower().endswith('.lnk')]
         if lnk_paths:
             targets_map = get_shortcut_targets_bulk(lnk_paths)
             for p, target in targets_map.items():
-                mtime = os.path.getmtime(p)
-                cached.append({'target': target, 'date': datetime.fromtimestamp(mtime, timezone.utc).replace(tzinfo=None)})
+                try:
+                    mtime = os.path.getmtime(p)
+                    cached.append({'target': os.path.abspath(target), 'date': datetime.fromtimestamp(mtime, timezone.utc).replace(tzinfo=None)})
+                except Exception: continue
 
+    print("Scanning for project directories...")
     target_dirs = {base_path}
     for root, dirs, files in os.walk(base_path):
         dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
@@ -341,22 +347,24 @@ def update_sc_date():
     for d in os.listdir(base_path):
         dp = os.path.join(base_path, d)
         if os.path.isdir(dp) and d.lower() not in ('sc', 'landscape', 'landscape rotate', 'edit', 'thumbnails', 'edit thumbnails'):
-            target_dirs.add(dp)
+            if dp not in target_dirs:
+                target_dirs.add(dp)
 
-    # Build a map of directory -> newest cached date to avoid O(N*M) nested loop
+    # Build a map of directory -> newest cached date
+    # Optimization: Instead of N*M loop, we check if target's parent hierarchy contains any of our target_dirs
+    print("Matching root shortcuts to project folders...")
     cached_map = {}
+    target_dirs_set = set(os.path.abspath(d) for d in target_dirs)
+
     for c in cached:
-        try:
-            # We want to find which of our target_dirs this cached shortcut target belongs to.
-            # Most likely it's a direct project folder or the base_path itself.
-            target = c['target']
-            for d in target_dirs:
-                if d == base_path: continue
-                if target.startswith(d + os.sep) or target == d:
-                    if d not in cached_map or c['date'] > cached_map[d]:
-                        cached_map[d] = c['date']
-        except Exception:
-            pass
+        curr = c['target']
+        # Walk up the path hierarchy to find the nearest project directory
+        while curr and curr != os.path.dirname(curr):
+            if curr in target_dirs_set:
+                if curr not in cached_map or c['date'] > cached_map[curr]:
+                    cached_map[curr] = c['date']
+                break
+            curr = os.path.dirname(curr)
 
     for directory in target_dirs:
         out_file = os.path.join(directory, 'scdate.txt')
