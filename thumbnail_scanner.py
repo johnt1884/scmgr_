@@ -324,7 +324,7 @@ def update_shortcut(path, new_target):
         print(f"Error updating shortcut {path}: {e}")
     return False
 
-def update_sc_date():
+def update_sc_date(verbose=False):
     print("\nUpdating scdate.txt files...")
     base_path = os.path.abspath(os.getcwd())
     root_sc = os.path.join(base_path, 'sc')
@@ -419,11 +419,13 @@ def update_sc_date():
 
             if write:
                 iso_date = newest.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+                if verbose:
+                    print(f"  - {os.path.relpath(directory, base_path)}: {iso_date}")
                 with open(out_file, 'w', encoding='utf-8') as f:
                     f.write(iso_date)
     print(f"Scanned {len(target_dirs)} directories, updated {updated_count} scdate.txt files.")
 
-def update_sc_data():
+def update_sc_data(verbose=False):
     print("\nUpdating scdata.txt files...")
     base_path = os.getcwd()
     skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
@@ -435,6 +437,8 @@ def update_sc_data():
             links = [f for f in os.listdir(sc_path) if f.lower().endswith('.lnk')]
             if links:
                 out = os.path.join(root, 'scdata.txt')
+                if verbose:
+                    print(f"  - {os.path.relpath(root, base_path)}: {len(links)} shortcuts")
                 with open(out, 'w', encoding='utf-8') as f:
                     for l in sorted(links):
                         f.write(l + '\n')
@@ -462,6 +466,8 @@ def update_sc_data():
                     groups[folder].append(f"{f_name} {tag}")
 
         if groups:
+            if verbose:
+                print(f"  - root: {sum(len(g) for g in groups.values())} shortcuts in {len(groups)} groups")
             with open(out, 'w', encoding='utf-8') as f:
                 for folder in sorted(groups.keys()):
                     f.write(f'"{folder}"\n')
@@ -473,7 +479,7 @@ def update_sc_data():
     elif os.path.exists(out):
         os.remove(out)
 
-def generate_sc_new():
+def generate_sc_new(verbose=False):
     print("\nGenerating scnew.txt...")
     base_path = os.getcwd()
     root_sc = os.path.join(base_path, 'sc')
@@ -511,13 +517,15 @@ def generate_sc_new():
                 new_links.sort(key=os.path.getmtime)
 
             if new_links:
+                if verbose:
+                    print(f"  - {d}: {len(new_links)} new shortcuts")
                 with open(scnew_file, 'w', encoding='utf-8') as f:
                     for l in new_links:
                         f.write(os.path.basename(l) + '\n')
             else:
                 if os.path.exists(scnew_file): os.remove(scnew_file)
 
-def update_selections():
+def update_selections(verbose=False):
     print("\nUpdating selections.txt files...")
     base_path = os.getcwd()
     special_folders = {'sc', 'landscape', 'landscape rotate', 'edit', 'thumbnails', 'edit thumbnails'}
@@ -525,7 +533,8 @@ def update_selections():
     for d in os.listdir(base_path):
         dp = os.path.join(base_path, d)
         if os.path.isdir(dp) and d.lower() not in special_folders:
-            print(f"Processing folder: {d}")
+            if verbose:
+                print(f"  - {d}")
             out = os.path.join(dp, 'selections.txt')
             with open(out, 'w', encoding='utf-8') as f:
                 for sub in ["sc", "Landscape", "Landscape Rotate", "Edit"]:
@@ -540,7 +549,7 @@ def update_selections():
 
 def update_shortcut_database():
     print("\nUpdating Shortcut Database...")
-    base_path = os.getcwd()
+    base_path = os.path.abspath(os.getcwd())
     db_file = "shortcut_db.txt"
     database = []
     skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
@@ -592,7 +601,10 @@ def update_shortcut_database():
                     'VideoPath': target,
                     'MD5': md5
                 })
-                print(f"Added: {file}")
+                if verbose:
+                    print(f"  - Added: {file}")
+                else:
+                    print(f"Added: {file}")
 
     with open(db_file, 'w', encoding='utf-8') as f:
         for entry in new_database:
@@ -654,14 +666,14 @@ def scan_broken_shortcuts_from_db():
         else:
             print(f"Original target directory no longer exists: {original_dir}")
 
-def run_shortcut_manager_menu():
+def run_shortcut_manager_menu(verbose=False):
     while True:
         print("\n--- Shortcut Manager ---")
         print("1. Update shortcut Database")
         print("2. Scan for broken Shortcuts")
         print("3. Back")
         choice = input("\nSelect an option: ")
-        if choice == '1': update_shortcut_database()
+        if choice == '1': update_shortcut_database(verbose=verbose)
         elif choice == '2': scan_broken_shortcuts_from_db()
         elif choice == '3': break
         else: print("Invalid choice.")
@@ -1058,16 +1070,16 @@ def main():
 
             if clean_choice == '1': run_normal_scan(deep_scan=False, generate_report=generate_report)
             elif clean_choice == '2': run_normal_scan(deep_scan=True, generate_report=generate_report)
-            elif clean_choice == '3': update_sc_date()
-            elif clean_choice == '4': update_sc_data()
-            elif clean_choice == '5': generate_sc_new()
-            elif clean_choice == '6': update_selections()
+            elif clean_choice == '3': update_sc_date(verbose=generate_report)
+            elif clean_choice == '4': update_sc_data(verbose=generate_report)
+            elif clean_choice == '5': generate_sc_new(verbose=generate_report)
+            elif clean_choice == '6': update_selections(verbose=generate_report)
             elif clean_choice == '7':
-                update_sc_date()
-                update_sc_data()
-                generate_sc_new()
-                update_selections()
-            elif clean_choice == '8': run_shortcut_manager_menu()
+                update_sc_date(verbose=generate_report)
+                update_sc_data(verbose=generate_report)
+                generate_sc_new(verbose=generate_report)
+                update_selections(verbose=generate_report)
+            elif clean_choice == '8': run_shortcut_manager_menu(verbose=generate_report)
             elif clean_choice == '9': run_empty_video_scan(generate_report=generate_report)
             elif clean_choice == '10': run_broken_shortcuts_scan(generate_report=generate_report)
             elif clean_choice == '11': return
