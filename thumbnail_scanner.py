@@ -21,7 +21,7 @@ def get_projects(base_path):
 
 def find_videos(project_path):
     videos = []
-    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
     for root, dirs, files in os.walk(project_path):
         dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
         for file in files:
@@ -279,9 +279,14 @@ def get_shortcut_targets_bulk(paths):
 
         try:
             escaped_tmp_path = tmp_path.replace("'", "''")
-            # Using -LiteralPath and -Encoding UTF8 for maximum compatibility
-            ps_script = f"$s=New-Object -ComObject WScript.Shell; Get-Content -LiteralPath '{escaped_tmp_path}' -Encoding UTF8 | ForEach-Object {{ try {{ $s.CreateShortcut($_).TargetPath }} catch {{ '' }} }}"
-            cmd = ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps_script]
+            # Refactored for speed: using .NET ReadLines and a fast foreach loop
+            ps_script = (
+                "$s = New-Object -ComObject WScript.Shell; "
+                f"[System.IO.File]::ReadLines('{escaped_tmp_path}') | ForEach-Object {{ "
+                "try { $s.CreateShortcut($_).TargetPath } catch { '' } "
+                "}"
+            )
+            cmd = ['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps_script]
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             targets = result.stdout.splitlines()
             for p, t in zip(paths, targets):
@@ -321,11 +326,12 @@ def update_shortcut(path, new_target):
 
 def update_sc_date():
     print("\nUpdating scdate.txt files...")
-    base_path = os.getcwd()
+    base_path = os.path.abspath(os.getcwd())
     root_sc = os.path.join(base_path, 'sc')
     cached = []
     skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
 
+    # 1. Resolve root-level shortcuts first
     if os.path.exists(root_sc):
         print("Processing root sc shortcuts...")
         lnk_paths = [os.path.join(root_sc, f) for f in os.listdir(root_sc) if f.lower().endswith('.lnk')]
@@ -334,41 +340,51 @@ def update_sc_date():
             for p, target in targets_map.items():
                 try:
                     mtime = os.path.getmtime(p)
-                    cached.append({'target': os.path.abspath(target), 'date': datetime.fromtimestamp(mtime, timezone.utc).replace(tzinfo=None)})
+                    # Normalize target path for robust matching
+                    norm_target = os.path.abspath(target)
+                    cached.append({'target': norm_target, 'date': datetime.fromtimestamp(mtime, timezone.utc).replace(tzinfo=None)})
                 except Exception: continue
 
-    print("Scanning for project directories...")
+    # 2. Identify all target directories
+    print("Identifying project directories...")
     target_dirs = {base_path}
     for root, dirs, files in os.walk(base_path):
         dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
+        # Any directory with an 'sc' subfolder is a project
         if 'sc' in dirs:
-            target_dirs.add(root)
+            target_dirs.add(os.path.abspath(root))
+        # Any immediate subdirectory of base_path (excluding specials) is a project
+        if os.path.abspath(root) == base_path:
+            for d in dirs:
+                if d.lower() not in ('sc', 'landscape', 'landscape rotate', 'edit', 'thumbnails', 'edit thumbnails'):
+                    target_dirs.add(os.path.abspath(os.path.join(root, d)))
 
-    for d in os.listdir(base_path):
-        dp = os.path.join(base_path, d)
-        if os.path.isdir(dp) and d.lower() not in ('sc', 'landscape', 'landscape rotate', 'edit', 'thumbnails', 'edit thumbnails'):
-            if dp not in target_dirs:
-                target_dirs.add(dp)
-
-    # Build a map of directory -> newest cached date
-    # Optimization: Instead of N*M loop, we check if target's parent hierarchy contains any of our target_dirs
-    print("Matching root shortcuts to project folders...")
+    # 3. Match root shortcuts to project folders using O(N * depth) walk
+    print(f"Matching {len(cached)} root shortcuts to {len(target_dirs)} folders...")
     cached_map = {}
-    target_dirs_set = set(os.path.abspath(d) for d in target_dirs)
+    target_dirs_set = {d.lower(): d for d in target_dirs}
 
     for c in cached:
         curr = c['target']
-        # Walk up the path hierarchy to find the nearest project directory
-        while curr and curr != os.path.dirname(curr):
-            if curr in target_dirs_set:
-                if curr not in cached_map or c['date'] > cached_map[curr]:
-                    cached_map[curr] = c['date']
+        while curr:
+            curr_lower = curr.lower()
+            if curr_lower in target_dirs_set:
+                actual_dir = target_dirs_set[curr_lower]
+                if actual_dir not in cached_map or c['date'] > cached_map[actual_dir]:
+                    cached_map[actual_dir] = c['date']
                 break
-            curr = os.path.dirname(curr)
+            parent = os.path.dirname(curr)
+            if parent == curr: break # Root reached
+            curr = parent
 
-    for directory in target_dirs:
+    # 4. Update each directory
+    print("Finalizing updates...")
+    updated_count = 0
+    for directory in sorted(target_dirs):
         out_file = os.path.join(directory, 'scdate.txt')
         newest = datetime.min
+
+        # Check project-local sc folder
         p_sc = os.path.join(directory, 'sc')
         if os.path.exists(p_sc):
             lnks = [os.path.join(p_sc, f) for f in os.listdir(p_sc) if f.lower().endswith('.lnk')]
@@ -376,12 +392,14 @@ def update_sc_date():
                 latest_lnk = max(lnks, key=os.path.getmtime)
                 newest = datetime.fromtimestamp(os.path.getmtime(latest_lnk), timezone.utc).replace(tzinfo=None)
 
+        # Merge with root-level shortcut dates
         if directory in cached_map:
             if cached_map[directory] > newest:
                 newest = cached_map[directory]
 
         if newest > datetime.min:
             write = True
+            updated_count += 1
             if os.path.exists(out_file):
                 try:
                     with open(out_file, 'r') as f:
@@ -403,11 +421,12 @@ def update_sc_date():
                 iso_date = newest.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
                 with open(out_file, 'w', encoding='utf-8') as f:
                     f.write(iso_date)
+    print(f"Scanned {len(target_dirs)} directories, updated {updated_count} scdate.txt files.")
 
 def update_sc_data():
     print("\nUpdating scdata.txt files...")
     base_path = os.getcwd()
-    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
     # Recursive sc folders
     for root, dirs, files in os.walk(base_path):
         dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
@@ -524,7 +543,7 @@ def update_shortcut_database():
     base_path = os.getcwd()
     db_file = "shortcut_db.txt"
     database = []
-    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
     if os.path.exists(db_file):
         with open(db_file, 'r') as f:
             current_entry = {}
@@ -651,7 +670,7 @@ def run_broken_shortcuts_scan(generate_report=False):
     base_path = os.getcwd()
     projects = get_projects(base_path)
     broken_shortcuts = [] # list of (shortcut_path, current_target)
-    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
 
     def scan_dir_for_shortcuts(directory, shortcuts_to_check):
         if not os.path.isdir(directory): return
