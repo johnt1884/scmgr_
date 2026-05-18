@@ -17,11 +17,11 @@ VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.JPG', '.JPEG', '.PNG', '.WEBP')
 
 def get_projects(base_path):
-    return [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d)) and not d.startswith('.')]
+    return [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d)) and not d.startswith('.') and d.lower() != "originals"]
 
 def find_videos(project_path):
     videos = []
-    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information', 'originals'}
     for root, dirs, files in os.walk(project_path):
         dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
         for file in files:
@@ -329,7 +329,7 @@ def update_sc_date(verbose=False):
     base_path = os.path.abspath(os.getcwd())
     root_sc = os.path.join(base_path, 'sc')
     cached = []
-    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information', 'originals'}
 
     # 1. Resolve root-level shortcuts first
     if os.path.exists(root_sc):
@@ -428,7 +428,7 @@ def update_sc_date(verbose=False):
 def update_sc_data(verbose=False):
     print("\nUpdating scdata.txt files...")
     base_path = os.getcwd()
-    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information', 'originals'}
     # Recursive sc folders
     for root, dirs, files in os.walk(base_path):
         dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
@@ -528,7 +528,7 @@ def generate_sc_new(verbose=False):
 def update_selections(verbose=False):
     print("\nUpdating selections.txt files...")
     base_path = os.getcwd()
-    special_folders = {'sc', 'landscape', 'landscape rotate', 'edit', 'thumbnails', 'edit thumbnails'}
+    special_folders = {'sc', 'landscape', 'landscape rotate', 'edit', 'thumbnails', 'edit thumbnails', 'originals'}
 
     for d in os.listdir(base_path):
         dp = os.path.join(base_path, d)
@@ -547,12 +547,12 @@ def update_selections(verbose=False):
                                 f.write(item + '\n')
                     f.write("\n")
 
-def update_shortcut_database():
+def update_shortcut_database(verbose=False):
     print("\nUpdating Shortcut Database...")
     base_path = os.path.abspath(os.getcwd())
     db_file = "shortcut_db.txt"
     database = []
-    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information', 'originals'}
     if os.path.exists(db_file):
         with open(db_file, 'r') as f:
             current_entry = {}
@@ -682,7 +682,7 @@ def run_broken_shortcuts_scan(generate_report=False):
     base_path = os.getcwd()
     projects = get_projects(base_path)
     broken_shortcuts = [] # list of (shortcut_path, current_target)
-    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information'}
+    skip_dirs = {'.git', '__pycache__', 'thumbnails', 'edit thumbnails', '$recycle.bin', 'system volume information', 'originals'}
 
     def scan_dir_for_shortcuts(directory, shortcuts_to_check):
         if not os.path.isdir(directory): return
