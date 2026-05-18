@@ -693,8 +693,10 @@ def run_broken_shortcuts_scan(generate_report=False):
 
     print("\nScanning for broken shortcuts...")
     all_lnk_to_check = []
-    # Scan root
+    # Scan current directory
     scan_dir_for_shortcuts(base_path, all_lnk_to_check)
+    # Scan root 'sc' folder if it exists
+    scan_dir_for_shortcuts(os.path.join(base_path, 'sc'), all_lnk_to_check)
     # Scan each project's 'sc' folder
     for project in projects:
         scan_dir_for_shortcuts(os.path.join(base_path, project, 'sc'), all_lnk_to_check)
