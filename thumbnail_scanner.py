@@ -52,10 +52,10 @@ def check_thumbnails_optimized(video_path, project_path, thumb_files, edit_files
     return main_found_file, edit_indices_found, edit_found_files
 
 def get_video_info(video_path):
-    """Get total frames, fps, and dimensions using ffprobe."""
+    """Get total frames, fps, and dimensions (including DAR) using ffprobe."""
     cmd = [
         'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-        '-show_entries', 'stream=nb_frames,avg_frame_rate,width,height',
+        '-show_entries', 'stream=nb_frames,avg_frame_rate,width,height,display_aspect_ratio,sample_aspect_ratio',
         '-of', 'json', video_path
     ]
     try:
@@ -82,9 +82,31 @@ def get_video_info(video_path):
         width = int(stream.get('width', 0))
         height = int(stream.get('height', 0))
         
-        return nb_frames, fps, width, height
+        # Determine actual aspect ratio (DAR)
+        dar = stream.get('display_aspect_ratio')
+        if dar and ':' in dar:
+            try:
+                num, den = map(int, dar.split(':'))
+                if den != 0: dar_val = num / den
+                else: dar_val = width / height if height != 0 else 1.0
+            except ValueError:
+                dar_val = width / height if height != 0 else 1.0
+        else:
+            # Try SAR if DAR is missing
+            sar = stream.get('sample_aspect_ratio')
+            if sar and ':' in sar:
+                try:
+                    num, den = map(int, sar.split(':'))
+                    if den != 0: dar_val = (width / height) * (num / den) if height != 0 else 1.0
+                    else: dar_val = width / height if height != 0 else 1.0
+                except ValueError:
+                    dar_val = width / height if height != 0 else 1.0
+            else:
+                dar_val = width / height if height != 0 else 1.0
+
+        return nb_frames, fps, width, height, dar_val
     except Exception:
-        return 0, 25.0, 0, 0
+        return 0, 25.0, 0, 0, 1.0
 
 def get_md5(path):
     if not os.path.exists(path): return None
@@ -117,7 +139,7 @@ def generate_video_thumbnails(task):
     video_path, project_path, gen_main, missing_edits = task
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     
-    nb_frames, fps, v_width, v_height = get_video_info(video_path)
+    nb_frames, fps, v_width, v_height, v_ar = get_video_info(video_path)
     if nb_frames <= 0:
         return video_path, False
 
@@ -143,31 +165,45 @@ def generate_video_thumbnails(task):
         return video_path, True
 
     # Determine which group (Portrait, Square, Landscape) this video belongs to
-    # Target ARs: Portrait (567/1008 = 0.5625), Square (1008/1008 = 1.0), Landscape (1792/1008 = 1.777)
-    v_ar = v_width / v_height if v_height != 0 else 1.0
-
-    # Calculate distance to each target aspect ratio
+    # New Target Dimensions (approx 50% of previous):
+    # Portrait (284x504 = 0.563), Square (504x504 = 1.0), Landscape (896x504 = 1.777)
     diffs = {
-        'portrait': (abs(v_ar - 0.5625), 567, 1008),
-        'square': (abs(v_ar - 1.0), 1008, 1008),
-        'landscape': (abs(v_ar - 1.777), 1792, 1008)
+        'portrait': (abs(v_ar - 0.5625), 284, 504),
+        'square': (abs(v_ar - 1.0), 504, 504),
+        'landscape': (abs(v_ar - 1.777), 896, 504)
     }
-    group = min(diffs.items(), key=lambda x: x[1][0])
-    target_w, target_h = group[1][1], group[1][2]
+    group_name, (_, target_w, target_h) = min(diffs.items(), key=lambda x: x[1][0])
 
-    # Build filters to ensure uniform size, no squishing, and full-range colors
-    # format=yuvj420p ensures full range colors (0-255) for JPEG, matching most videos
-    scale_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease"
-    pad_filter = f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
-    color_filter = "format=yuvj420p"
+    # 10% Tolerance Logic
+    # We want to scale the video dimensions to fit into target_w x target_h whilst preserving v_ar.
+    # The resulting dimensions (rw, rh) will be:
+    if v_ar >= (target_w / target_h): # Video is wider than target area (relative to target group)
+        rw = target_w
+        rh = int(target_w / v_ar)
+    else: # Video is taller than target area
+        rh = target_h
+        rw = int(target_h * v_ar)
+
+    # Check if results are within 10% of target group dimensions
+    w_diff = abs(rw - target_w) / target_w
+    h_diff = abs(rh - target_h) / target_h
+
+    use_padding = w_diff > 0.10 or h_diff > 0.10
+
+    # Build filters
+    # setsar=1 prevents squishing when video has non-square pixels
+    filter_list = [scale_filter := f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease"]
+    if use_padding:
+        filter_list.append(f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2")
+
+    filter_list.extend(["setsar=1", "format=yuvj420p"])
 
     success = True
     try:
-        # We'll generate all requested slots in one pass with the same scaling/padding
         unique_frames = sorted(list(set(all_target_frames[s] for s in slots_to_generate)))
         select_str = " + ".join([f"eq(n,{idx})" for idx in unique_frames])
 
-        filter_parts = [f"select='{select_str}'", scale_filter, pad_filter, color_filter, "setpts=N/FRAME_RATE/TB"]
+        filter_parts = [f"select='{select_str}'"] + filter_list + ["setpts=N/FRAME_RATE/TB"]
         filter_graph = ",".join(filter_parts)
             
         temp_pattern = os.path.join(project_path, f"tmp_{video_name}_%d.jpg")
@@ -208,18 +244,18 @@ def generate_video_thumbnails(task):
         if 10 in missing_edits:
             slot_10_path = os.path.join(edit_dir, f"{video_name}_10.jpg")
             if not os.path.exists(slot_10_path):
-                fallback_filter = ",".join([scale_filter, pad_filter, color_filter])
+                fallback_filter_str = ",".join(filter_list)
                 # Using -sseof -1 allows seeking to 1 second before end
                 cmd_fallback = [
                     'ffmpeg', '-y', '-sseof', '-1', '-i', video_path,
-                    '-vf', fallback_filter, '-update', '1', '-frames:v', '1', '-q:v', '2',
+                    '-vf', fallback_filter_str, '-update', '1', '-frames:v', '1', '-q:v', '2',
                     slot_10_path
                 ]
                 if subprocess.run(cmd_fallback, capture_output=True).returncode != 0:
                     # If -sseof -1 fails (e.g. video < 1s), try without seeking
                     cmd_fallback_no_seek = [
                         'ffmpeg', '-y', '-i', video_path,
-                        '-vf', fallback_filter, '-frames:v', '1', '-q:v', '2',
+                        '-vf', fallback_filter_str, '-frames:v', '1', '-q:v', '2',
                         slot_10_path
                     ]
                     subprocess.run(cmd_fallback_no_seek, capture_output=True)
@@ -889,28 +925,45 @@ def run_normal_scan(deep_scan=False, generate_report=False):
             needs_main_fix = False
             
             if deep_scan:
-                nb_frames, fps, v_width, v_height = get_video_info(video)
+                nb_frames, fps, v_width, v_height, v_ar = get_video_info(video)
                 if v_width > 0 and v_height > 0:
-                    v_ar = v_width / v_height
                     diffs = {
-                        'portrait': (abs(v_ar - 0.5625), 567, 1008),
-                        'square': (abs(v_ar - 1.0), 1008, 1008),
-                        'landscape': (abs(v_ar - 1.777), 1792, 1008)
+                        'portrait': (abs(v_ar - 0.5625), 284, 504),
+                        'square': (abs(v_ar - 1.0), 504, 504),
+                        'landscape': (abs(v_ar - 1.777), 896, 504)
                     }
-                    group = min(diffs.items(), key=lambda x: x[1][0])
-                    target_w, target_h = group[1][1], group[1][2]
+                    group_name, (_, target_w, target_h) = min(diffs.items(), key=lambda x: x[1][0])
+
+                    # Calculate natural scaled dimensions for 10% tolerance check
+                    if v_ar >= (target_w / target_h):
+                        rw, rh = target_w, int(target_w / v_ar)
+                    else:
+                        rh, rw = target_h, int(target_h * v_ar)
+
+                    def is_valid_dim(w, h):
+                        # Valid if exactly group dimensions
+                        if w == target_w and h == target_h: return True
+                        # OR if within 10% tolerance of target dimensions AND matches natural scale
+                        w_tol = abs(w - target_w) / target_w
+                        h_tol = abs(h - target_h) / target_h
+                        if w_tol <= 0.10 and h_tol <= 0.10:
+                            # Also check if it matches the natural aspect ratio closely
+                            # to avoid "squished but small" images being valid
+                            if abs(w - rw) <= 2 and abs(h - rh) <= 2:
+                                return True
+                        return False
 
                     if main_file:
                         main_path = os.path.join(thumb_dir, main_file)
                         w, h = get_image_dimensions(main_path)
-                        if w != target_w or h != target_h:
+                        if not is_valid_dim(w, h):
                             needs_main_fix = True
                             results['total_wrong_dimensions'] += 1
 
                     for i, f in zip(edit_indices, edit_files_found):
                         edit_path = os.path.join(edit_dir, f)
                         w, h = get_image_dimensions(edit_path)
-                        if w != target_w or h != target_h:
+                        if not is_valid_dim(w, h):
                             wrong_dim_edits.append(i)
                             results['total_wrong_dimensions'] += 1
 
