@@ -61,49 +61,63 @@ def get_video_info(video_path):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         data = json.loads(result.stdout)
-        stream = data.get('streams', [{}])[0]
+        streams = data.get('streams', [])
+        if not streams: return 0, 25.0, 0, 0, 1.0
+        stream = streams[0]
         
         fps = 25.0
         avg_frame_rate = stream.get('avg_frame_rate', '25/1')
         if '/' in avg_frame_rate:
-            num, den = map(int, avg_frame_rate.split('/'))
-            if den != 0: fps = num / den
+            parts = avg_frame_rate.split('/')
+            if len(parts) == 2:
+                num, den = map(int, parts)
+                if den != 0: fps = num / den
         else:
-            fps = float(avg_frame_rate)
+            try: fps = float(avg_frame_rate)
+            except ValueError: pass
             
         nb_frames = int(stream.get('nb_frames', 0))
         if nb_frames == 0:
-            # Fallback for some formats: try to calculate from duration
-            cmd_dur = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', video_path]
-            res_dur = subprocess.run(cmd_dur, capture_output=True, text=True, check=True)
-            dur = float(json.loads(res_dur.stdout).get('format', {}).get('duration', 0))
-            nb_frames = int(dur * fps)
+            try:
+                cmd_dur = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', video_path]
+                res_dur = subprocess.run(cmd_dur, capture_output=True, text=True, check=True)
+                dur = float(json.loads(res_dur.stdout).get('format', {}).get('duration', 0))
+                nb_frames = int(dur * fps)
+            except Exception: pass
             
         width = int(stream.get('width', 0))
         height = int(stream.get('height', 0))
         
         # Determine actual aspect ratio (DAR)
-        dar = stream.get('display_aspect_ratio')
-        if dar and ':' in dar:
-            try:
-                num, den = map(int, dar.split(':'))
-                if den != 0: dar_val = num / den
-                else: dar_val = width / height if height != 0 else 1.0
-            except ValueError:
-                dar_val = width / height if height != 0 else 1.0
-        else:
-            # Try SAR if DAR is missing
-            sar = stream.get('sample_aspect_ratio')
-            if sar and ':' in sar:
+        dar_val = None
+        dar_str = stream.get('display_aspect_ratio')
+        if dar_str and dar_str != "0:1":
+            if ':' in dar_str:
                 try:
-                    num, den = map(int, sar.split(':'))
-                    if den != 0: dar_val = (width / height) * (num / den) if height != 0 else 1.0
-                    else: dar_val = width / height if height != 0 else 1.0
-                except ValueError:
-                    dar_val = width / height if height != 0 else 1.0
+                    num, den = map(int, dar_str.split(':'))
+                    if den != 0: dar_val = num / den
+                except ValueError: pass
             else:
-                dar_val = width / height if height != 0 else 1.0
+                try:
+                    dar_val = float(dar_str)
+                except ValueError: pass
 
+        if dar_val is None or dar_val <= 0:
+            sar_val = 1.0
+            sar_str = stream.get('sample_aspect_ratio')
+            if sar_str and sar_str != "0:1":
+                if ':' in sar_str:
+                    try:
+                        num, den = map(int, sar_str.split(':'))
+                        if den != 0: sar_val = num / den
+                    except ValueError: pass
+                else:
+                    try:
+                        sar_val = float(sar_str)
+                    except ValueError: pass
+            dar_val = (width / height) * sar_val if height != 0 else 1.0
+
+        if dar_val <= 0: dar_val = 1.0
         return nb_frames, fps, width, height, dar_val
     except Exception:
         return 0, 25.0, 0, 0, 1.0
@@ -166,7 +180,7 @@ def generate_video_thumbnails(task):
 
     # Determine which group (Portrait, Square, Landscape) this video belongs to
     # New Target Dimensions (approx 50% of previous):
-    # Portrait (284x504 = 0.563), Square (504x504 = 1.0), Landscape (896x504 = 1.777)
+    # Portrait (284x504 = 0.5635), Square (504x504 = 1.0), Landscape (896x504 = 1.777)
     diffs = {
         'portrait': (abs(v_ar - 0.5625), 284, 504),
         'square': (abs(v_ar - 1.0), 504, 504),
@@ -176,23 +190,17 @@ def generate_video_thumbnails(task):
 
     # 10% Tolerance Logic
     # We want to scale the video dimensions to fit into target_w x target_h whilst preserving v_ar.
-    # The resulting dimensions (rw, rh) will be:
-    if v_ar >= (target_w / target_h): # Video is wider than target area (relative to target group)
-        rw = target_w
-        rh = int(target_w / v_ar)
-    else: # Video is taller than target area
-        rh = target_h
-        rw = int(target_h * v_ar)
+    if v_ar >= (target_w / target_h):
+        rw, rh = target_w, int(target_w / v_ar)
+    else:
+        rh, rw = target_h, int(target_h * v_ar)
 
-    # Check if results are within 10% of target group dimensions
     w_diff = abs(rw - target_w) / target_w
     h_diff = abs(rh - target_h) / target_h
-
     use_padding = w_diff > 0.10 or h_diff > 0.10
 
     # Build filters
-    # setsar=1 prevents squishing when video has non-square pixels
-    filter_list = [scale_filter := f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease"]
+    filter_list = [f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease"]
     if use_padding:
         filter_list.append(f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2")
 
@@ -934,21 +942,18 @@ def run_normal_scan(deep_scan=False, generate_report=False):
                     }
                     group_name, (_, target_w, target_h) = min(diffs.items(), key=lambda x: x[1][0])
 
-                    # Calculate natural scaled dimensions for 10% tolerance check
                     if v_ar >= (target_w / target_h):
                         rw, rh = target_w, int(target_w / v_ar)
                     else:
                         rh, rw = target_h, int(target_h * v_ar)
 
+                    w_diff_tol = abs(rw - target_w) / target_w
+                    h_diff_tol = abs(rh - target_h) / target_h
+                    needs_pad = w_diff_tol > 0.10 or h_diff_tol > 0.10
+
                     def is_valid_dim(w, h):
-                        # Valid if exactly group dimensions
                         if w == target_w and h == target_h: return True
-                        # OR if within 10% tolerance of target dimensions AND matches natural scale
-                        w_tol = abs(w - target_w) / target_w
-                        h_tol = abs(h - target_h) / target_h
-                        if w_tol <= 0.10 and h_tol <= 0.10:
-                            # Also check if it matches the natural aspect ratio closely
-                            # to avoid "squished but small" images being valid
+                        if not needs_pad:
                             if abs(w - rw) <= 2 and abs(h - rh) <= 2:
                                 return True
                         return False
