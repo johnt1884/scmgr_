@@ -143,14 +143,14 @@ def generate_video_thumbnails(task):
         return video_path, True
 
     # Determine which group (Portrait, Square, Landscape) this video belongs to
-    # Target ARs: Portrait (192/256 = 0.75), Square (256/256 = 1.0), Landscape (342/256 = 1.336)
+    # Target ARs: Portrait (567/1008 = 0.5625), Square (1008/1008 = 1.0), Landscape (1792/1008 = 1.777)
     v_ar = v_width / v_height if v_height != 0 else 1.0
 
     # Calculate distance to each target aspect ratio
     diffs = {
-        'portrait': (abs(v_ar - 0.75), 192, 256),
-        'square': (abs(v_ar - 1.0), 256, 256),
-        'landscape': (abs(v_ar - 1.336), 342, 256)
+        'portrait': (abs(v_ar - 0.5625), 567, 1008),
+        'square': (abs(v_ar - 1.0), 1008, 1008),
+        'landscape': (abs(v_ar - 1.777), 1792, 1008)
     }
     group = min(diffs.items(), key=lambda x: x[1][0])
     target_w, target_h = group[1][1], group[1][2]
@@ -893,9 +893,9 @@ def run_normal_scan(deep_scan=False, generate_report=False):
                 if v_width > 0 and v_height > 0:
                     v_ar = v_width / v_height
                     diffs = {
-                        'portrait': (abs(v_ar - 0.75), 192, 256),
-                        'square': (abs(v_ar - 1.0), 256, 256),
-                        'landscape': (abs(v_ar - 1.336), 342, 256)
+                        'portrait': (abs(v_ar - 0.5625), 567, 1008),
+                        'square': (abs(v_ar - 1.0), 1008, 1008),
+                        'landscape': (abs(v_ar - 1.777), 1792, 1008)
                     }
                     group = min(diffs.items(), key=lambda x: x[1][0])
                     target_w, target_h = group[1][1], group[1][2]
