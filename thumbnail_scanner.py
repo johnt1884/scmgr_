@@ -70,8 +70,10 @@ def get_video_info(video_path):
         if '/' in avg_frame_rate:
             parts = avg_frame_rate.split('/')
             if len(parts) == 2:
-                num, den = map(int, parts)
-                if den != 0: fps = num / den
+                try:
+                    num, den = map(int, parts)
+                    if den != 0: fps = num / den
+                except ValueError: pass
         else:
             try: fps = float(avg_frame_rate)
             except ValueError: pass
@@ -90,11 +92,14 @@ def get_video_info(video_path):
         
         # Determine actual aspect ratio (DAR)
         dar_val = None
+
+        # Priority 1: display_aspect_ratio
         dar_str = stream.get('display_aspect_ratio')
-        if dar_str and dar_str != "0:1":
-            if ':' in dar_str:
+        if dar_str and dar_str not in ("0:1", "0/1"):
+            if ':' in dar_str or '/' in dar_str:
+                sep = ':' if ':' in dar_str else '/'
                 try:
-                    num, den = map(int, dar_str.split(':'))
+                    num, den = map(int, dar_str.split(sep))
                     if den != 0: dar_val = num / den
                 except ValueError: pass
             else:
