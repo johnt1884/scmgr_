@@ -142,24 +142,32 @@ def generate_video_thumbnails(task):
     if not slots_to_generate:
         return video_path, True
 
-    # Determine orientation based on raw video dimensions
-    is_landscape = v_width >= v_height
+    # Determine which group (Portrait, Square, Landscape) this video belongs to
+    # Target ARs: Portrait (192/256 = 0.75), Square (256/256 = 1.0), Landscape (342/256 = 1.336)
+    v_ar = v_width / v_height if v_height != 0 else 1.0
 
-    # Rule: Preserve aspect ratio. Landscape h=256, Portrait w=192.
-    if is_landscape:
-        scale_str = "scale=-1:256"
-    else:
-        scale_str = "scale=192:-1"
+    # Calculate distance to each target aspect ratio
+    diffs = {
+        'portrait': (abs(v_ar - 0.75), 192, 256),
+        'square': (abs(v_ar - 1.0), 256, 256),
+        'landscape': (abs(v_ar - 1.336), 342, 256)
+    }
+    group = min(diffs.items(), key=lambda x: x[1][0])
+    target_w, target_h = group[1][1], group[1][2]
+
+    # Build filters to ensure uniform size, no squishing, and full-range colors
+    # format=yuvj420p ensures full range colors (0-255) for JPEG, matching most videos
+    scale_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease"
+    pad_filter = f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
+    color_filter = "format=yuvj420p"
 
     success = True
     try:
-        # We'll generate all requested slots in one pass with the same scaling
+        # We'll generate all requested slots in one pass with the same scaling/padding
         unique_frames = sorted(list(set(all_target_frames[s] for s in slots_to_generate)))
         select_str = " + ".join([f"eq(n,{idx})" for idx in unique_frames])
 
-        filter_parts = [f"select='{select_str}'"]
-        filter_parts.append(scale_str)
-        filter_parts.append("setpts=N/FRAME_RATE/TB")
+        filter_parts = [f"select='{select_str}'", scale_filter, pad_filter, color_filter, "setpts=N/FRAME_RATE/TB"]
         filter_graph = ",".join(filter_parts)
             
         temp_pattern = os.path.join(project_path, f"tmp_{video_name}_%d.jpg")
@@ -200,17 +208,18 @@ def generate_video_thumbnails(task):
         if 10 in missing_edits:
             slot_10_path = os.path.join(edit_dir, f"{video_name}_10.jpg")
             if not os.path.exists(slot_10_path):
+                fallback_filter = ",".join([scale_filter, pad_filter, color_filter])
                 # Using -sseof -1 allows seeking to 1 second before end
                 cmd_fallback = [
                     'ffmpeg', '-y', '-sseof', '-1', '-i', video_path,
-                    '-vf', scale_str, '-update', '1', '-frames:v', '1', '-q:v', '2',
+                    '-vf', fallback_filter, '-update', '1', '-frames:v', '1', '-q:v', '2',
                     slot_10_path
                 ]
                 if subprocess.run(cmd_fallback, capture_output=True).returncode != 0:
                     # If -sseof -1 fails (e.g. video < 1s), try without seeking
                     cmd_fallback_no_seek = [
                         'ffmpeg', '-y', '-i', video_path,
-                        '-vf', scale_str, '-frames:v', '1', '-q:v', '2',
+                        '-vf', fallback_filter, '-frames:v', '1', '-q:v', '2',
                         slot_10_path
                     ]
                     subprocess.run(cmd_fallback_no_seek, capture_output=True)
@@ -882,31 +891,26 @@ def run_normal_scan(deep_scan=False, generate_report=False):
             if deep_scan:
                 nb_frames, fps, v_width, v_height = get_video_info(video)
                 if v_width > 0 and v_height > 0:
-                    is_landscape = v_width >= v_height
-
-                    # Rule: Preserve aspect ratio. Landscape h=256, Portrait w=192.
-                    if is_landscape:
-                        target_h = 256
-                        target_w = int(v_width * (256 / v_height))
-                    else:
-                        target_w = 192
-                        target_h = int(v_height * (192 / v_width))
-                    
-                    # Tolerance for rounding: allow +/- 2 pixels
-                    def dims_match(w, h, tw, th):
-                        return abs(w - tw) <= 2 and abs(h - th) <= 2
+                    v_ar = v_width / v_height
+                    diffs = {
+                        'portrait': (abs(v_ar - 0.75), 192, 256),
+                        'square': (abs(v_ar - 1.0), 256, 256),
+                        'landscape': (abs(v_ar - 1.336), 342, 256)
+                    }
+                    group = min(diffs.items(), key=lambda x: x[1][0])
+                    target_w, target_h = group[1][1], group[1][2]
 
                     if main_file:
                         main_path = os.path.join(thumb_dir, main_file)
                         w, h = get_image_dimensions(main_path)
-                        if not dims_match(w, h, target_w, target_h):
+                        if w != target_w or h != target_h:
                             needs_main_fix = True
                             results['total_wrong_dimensions'] += 1
 
                     for i, f in zip(edit_indices, edit_files_found):
                         edit_path = os.path.join(edit_dir, f)
                         w, h = get_image_dimensions(edit_path)
-                        if not dims_match(w, h, target_w, target_h):
+                        if w != target_w or h != target_h:
                             wrong_dim_edits.append(i)
                             results['total_wrong_dimensions'] += 1
 
